@@ -1,0 +1,14 @@
+[project]
+name = "glock-shared-protocol"
+version = "1.0.0"
+description = "Glock Shared Protocol - Types and schemas for client-server communication"
+requires-python = ">=3.11"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["packages.shared_protocol"]
+package-dir = {"packages.shared_protocol" = "."}

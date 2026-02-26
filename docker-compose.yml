@@ -1,0 +1,70 @@
+# Docker Compose for Glock - Model B Architecture
+# Local development setup
+
+version: '3.8'
+
+services:
+  # Gateway service - the ONLY server component needed
+  gateway:
+    build:
+      context: .
+      dockerfile: infra/docker/gateway.Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://glock:glock@postgres:5432/glock
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=${JWT_SECRET:-your-development-secret-key-at-least-32-chars}
+      - JWT_ISSUER=glock.dev
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - CONTEXT_MASTER_KEY=${CONTEXT_MASTER_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+      - LOG_LEVEL=info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # PostgreSQL database
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=glock
+      - POSTGRES_PASSWORD=glock
+      - POSTGRES_DB=glock
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/supabase/migrations:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U glock"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for sessions and caching
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  redis_data:

@@ -1,0 +1,102 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RelayProtocol",
+  "description": "Gateway relay protocol for client↔gateway↔runtime communication",
+  "definitions": {
+    "relay_envelope": {
+      "type": "object",
+      "required": ["relay_type", "session_id", "direction", "inner"],
+      "properties": {
+        "relay_type": {
+          "type": "string",
+          "const": "relay"
+        },
+        "session_id": {
+          "type": "string",
+          "pattern": "^sess_[a-z0-9]{24}$"
+        },
+        "direction": {
+          "type": "string",
+          "enum": ["client_to_runtime", "runtime_to_client"]
+        },
+        "gateway_id": {
+          "type": "string",
+          "description": "Gateway instance handling this relay"
+        },
+        "relay_seq": {
+          "type": "integer",
+          "description": "Relay-level sequence number"
+        },
+        "relay_ts": {
+          "type": "integer",
+          "description": "Relay timestamp in milliseconds"
+        },
+        "inner": {
+          "type": "object",
+          "description": "The actual GlockMessageEnvelope being relayed"
+        }
+      }
+    },
+    "runtime_bind": {
+      "type": "object",
+      "required": ["session_id", "bind_token", "runtime_id"],
+      "properties": {
+        "session_id": { "type": "string" },
+        "bind_token": { "type": "string" },
+        "runtime_id": { "type": "string" },
+        "nonce": { "type": "string" },
+        "issued_at": { "type": "string", "format": "date-time" },
+        "expires_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "bind_confirmed": {
+      "type": "object",
+      "required": ["session_id", "runtime_id"],
+      "properties": {
+        "session_id": { "type": "string" },
+        "runtime_id": { "type": "string" },
+        "bound_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "routing_info": {
+      "type": "object",
+      "description": "Session routing information stored in Redis",
+      "properties": {
+        "session_id": { "type": "string" },
+        "client": {
+          "type": "object",
+          "properties": {
+            "gateway_id": { "type": "string" },
+            "conn_id": { "type": "string" },
+            "connected_at": { "type": "number" },
+            "status": {
+              "type": "string",
+              "enum": ["connected", "disconnected"]
+            }
+          }
+        },
+        "runtime": {
+          "type": "object",
+          "properties": {
+            "runtime_id": { "type": "string" },
+            "conn_id": { "type": "string" },
+            "status": {
+              "type": "string",
+              "enum": ["warming", "ready", "busy", "draining", "disconnected"]
+            },
+            "connected_at": { "type": "number" }
+          }
+        },
+        "allocation": {
+          "type": "object",
+          "properties": {
+            "host_id": { "type": "string" },
+            "process_id": { "type": "string" },
+            "bind_token": { "type": "string" },
+            "allocated_at": { "type": "number" }
+          }
+        }
+      }
+    }
+  }
+}

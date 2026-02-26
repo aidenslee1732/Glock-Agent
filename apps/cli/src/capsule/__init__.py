@@ -1,0 +1,16 @@
+"""Capsule isolation for Glock sessions.
+
+Capsules provide isolated execution environments for tools,
+either via process isolation or Docker containers.
+"""
+
+from .factory import CapsuleFactory, CapsuleMode
+from .process import ProcessCapsule
+from .docker import DockerCapsule
+
+__all__ = [
+    "CapsuleFactory",
+    "CapsuleMode",
+    "ProcessCapsule",
+    "DockerCapsule",
+]

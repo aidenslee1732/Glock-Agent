@@ -1,0 +1,57 @@
+# Railway service definitions for Glock
+# Model B Architecture - Client-Orchestrated
+
+services:
+  # Gateway service - handles client WS connections, LLM proxy, and REST API
+  # In Model B, this is the ONLY server component needed for the main flow
+  gateway-service:
+    dockerfile: infra/docker/gateway.Dockerfile
+    replicas: 2
+    healthcheck:
+      path: /health
+      interval: 30s
+      timeout: 10s
+    env:
+      - DATABASE_URL: ${{Postgres.DATABASE_URL}}
+      - REDIS_URL: ${{Redis.REDIS_URL}}
+      - JWT_SECRET: ${{shared.JWT_SECRET}}
+      - JWT_ISSUER: glock.dev
+      - ANTHROPIC_API_KEY: ${{shared.ANTHROPIC_API_KEY}}
+      - OPENAI_API_KEY: ${{shared.OPENAI_API_KEY}}
+      - CONTEXT_MASTER_KEY: ${{shared.CONTEXT_MASTER_KEY}}
+      - LOG_LEVEL: info
+      # Model B: No runtime host needed - client does orchestration
+
+  # Healer worker - handles validation failures and retries
+  # Still useful for server-side healing in enterprise mode
+  healer-worker:
+    dockerfile: infra/docker/gateway.Dockerfile
+    replicas: 1
+    command: python -m apps.server.src.healer.main
+    env:
+      - DATABASE_URL: ${{Postgres.DATABASE_URL}}
+      - REDIS_URL: ${{Redis.REDIS_URL}}
+      - HEALER_MAX_RETRIES: 3
+      - LOG_LEVEL: info
+
+  # Metering worker - aggregates usage events
+  metering-worker:
+    dockerfile: infra/docker/gateway.Dockerfile
+    replicas: 1
+    command: python -m apps.server.src.metering.main
+    env:
+      - DATABASE_URL: ${{Postgres.DATABASE_URL}}
+      - REDIS_URL: ${{Redis.REDIS_URL}}
+      - METERING_BATCH_SIZE: 100
+      - LOG_LEVEL: info
+
+# Databases
+databases:
+  - name: Postgres
+    plugin: postgresql
+
+  - name: Redis
+    plugin: redis
+
+# Removed in Model B:
+# - runtime-host: No longer needed - client orchestrates directly

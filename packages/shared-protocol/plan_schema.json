@@ -1,0 +1,109 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CompiledPlan",
+  "description": "Server-compiled and signed execution plan",
+  "type": "object",
+  "required": [
+    "plan_id", "session_id", "task_id", "issued_at", "expires_at",
+    "signature", "objective", "execution_mode", "allowed_tools"
+  ],
+  "properties": {
+    "plan_id": {
+      "type": "string",
+      "pattern": "^plan_[a-z0-9]{24}$",
+      "description": "Unique plan identifier"
+    },
+    "session_id": {
+      "type": "string",
+      "pattern": "^sess_[a-z0-9]{24}$"
+    },
+    "task_id": {
+      "type": "string",
+      "pattern": "^task_[a-z0-9]{24}$"
+    },
+    "issued_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp when plan was issued"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp when plan expires"
+    },
+    "signature": {
+      "type": "string",
+      "description": "Ed25519 signature of canonicalized plan"
+    },
+    "signature_alg": {
+      "type": "string",
+      "enum": ["ed25519"],
+      "default": "ed25519"
+    },
+    "kid": {
+      "type": "string",
+      "description": "Key ID for signature verification"
+    },
+    "payload_hash": {
+      "type": "string",
+      "description": "SHA256 hash of canonicalized payload"
+    },
+    "objective": {
+      "type": "string",
+      "description": "Task description/objective"
+    },
+    "execution_mode": {
+      "type": "string",
+      "enum": ["direct", "escalated", "retry"],
+      "description": "Execution mode based on complexity/risk"
+    },
+    "allowed_tools": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "List of tools permitted for this task"
+    },
+    "workspace_scope": {
+      "type": "string",
+      "description": "Root path restriction for file operations"
+    },
+    "edit_scope": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Glob patterns for editable files"
+    },
+    "validation_steps": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Required validation steps (test, lint, typecheck)"
+    },
+    "approval_requirements": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "patterns": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "require_approval": { "type": "boolean" }
+        }
+      },
+      "description": "Per-tool approval rules"
+    },
+    "risk_flags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Coarse risk labels (auth, secrets, deploy, etc.)"
+    },
+    "budgets": {
+      "type": "object",
+      "properties": {
+        "max_iterations": { "type": "integer", "default": 50 },
+        "max_tool_calls": { "type": "integer", "default": 100 },
+        "max_retries": { "type": "integer", "default": 2 },
+        "timeout_ms": { "type": "integer", "default": 600000 }
+      },
+      "description": "Execution budget limits"
+    }
+  }
+}

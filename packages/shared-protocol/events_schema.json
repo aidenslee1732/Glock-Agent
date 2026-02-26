@@ -1,0 +1,100 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "GlockEvents",
+  "description": "Usage and audit event schemas",
+  "definitions": {
+    "usage_event": {
+      "type": "object",
+      "required": ["event_type", "user_id", "quantity", "unit"],
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "event_type": {
+          "type": "string",
+          "enum": [
+            "task_started", "task_completed", "task_failed", "task_cancelled",
+            "tokens_used", "tool_executed", "validation_run",
+            "session_started", "session_ended",
+            "retry_attempted", "plan_compiled"
+          ]
+        },
+        "org_id": { "type": ["string", "null"] },
+        "user_id": { "type": "string" },
+        "session_id": { "type": ["string", "null"] },
+        "task_id": { "type": ["string", "null"] },
+        "quantity": { "type": "number" },
+        "unit": {
+          "type": "string",
+          "enum": ["count", "tokens", "seconds", "bytes", "validations"]
+        },
+        "metadata": { "type": "object" },
+        "created_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "audit_event": {
+      "type": "object",
+      "required": ["action", "actor_type", "actor_id", "user_id"],
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "org_id": { "type": ["string", "null"] },
+        "user_id": { "type": "string" },
+        "session_id": { "type": ["string", "null"] },
+        "task_id": { "type": ["string", "null"] },
+        "action": {
+          "type": "string",
+          "enum": [
+            "runtime_bind", "runtime_rebind", "runtime_release",
+            "client_attach", "client_detach",
+            "session_park", "session_unpark", "session_end",
+            "secret_access_granted", "secret_access_denied",
+            "approval_requested", "approval_granted", "approval_denied",
+            "plan_compiled", "plan_expired",
+            "validation_passed", "validation_failed",
+            "retry_started", "retry_exhausted"
+          ]
+        },
+        "actor_type": {
+          "type": "string",
+          "enum": ["user", "system", "healer", "runtime"]
+        },
+        "actor_id": { "type": "string" },
+        "severity": {
+          "type": "string",
+          "enum": ["info", "warn", "high", "critical"],
+          "default": "info"
+        },
+        "details": { "type": "object" },
+        "created_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "validation_result": {
+      "type": "object",
+      "required": ["task_id", "attempt_no", "step_name", "status"],
+      "properties": {
+        "task_id": { "type": "string" },
+        "attempt_no": { "type": "integer" },
+        "step_name": { "type": "string" },
+        "status": {
+          "type": "string",
+          "enum": ["passed", "failed", "skipped", "error", "timeout"]
+        },
+        "output_summary": { "type": "string" },
+        "failures": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "test_name": { "type": "string" },
+              "file": { "type": "string" },
+              "line": { "type": "integer" },
+              "expected": { "type": "string" },
+              "actual": { "type": "string" },
+              "message": { "type": "string" }
+            }
+          }
+        },
+        "started_at": { "type": "string", "format": "date-time" },
+        "completed_at": { "type": "string", "format": "date-time" }
+      }
+    }
+  }
+}

@@ -1,0 +1,27 @@
+[project]
+name = "glock-server"
+version = "1.0.0"
+description = "Glock Server - Gateway and Control Plane"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "websockets>=12.0",
+    "redis>=5.0.0",
+    "asyncpg>=0.29.0",
+    "pyjwt>=2.8.0",
+    "pydantic>=2.0.0",
+    "cryptography>=41.0.0",
+    "litellm>=1.0.0",
+    "httpx>=0.25.0",
+]
+
+[project.scripts]
+glock-server = "src.main:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["src"]

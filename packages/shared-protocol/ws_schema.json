@@ -1,0 +1,158 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "GlockMessageEnvelope",
+  "description": "WebSocket message envelope with seq/ack for reliable delivery",
+  "type": "object",
+  "required": ["v", "type", "session_id", "message_id", "seq", "ack", "timestamp_ms", "payload"],
+  "properties": {
+    "v": {
+      "type": "integer",
+      "const": 1,
+      "description": "Protocol version"
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "session_start", "session_ready", "resume_request", "resume_from_seq",
+        "heartbeat", "heartbeat_ack", "warning", "session_error", "session_end",
+        "task_start", "task_delta", "task_status", "task_complete", "task_failed",
+        "cancel_requested", "cancel_ack",
+        "compiled_plan", "task_budget_update",
+        "tool_request", "tool_result", "tool_error",
+        "tool_approval_request", "tool_approval_response",
+        "deploy_approval_request", "deploy_approval_response",
+        "validation_request", "validation_result",
+        "retry_plan_ready", "retry_exhausted",
+        "diff_preview", "checkpoint_created",
+        "runtime_bind", "bind_confirmed", "bind_error",
+        "client_disconnected", "runtime_recovered"
+      ],
+      "description": "Message type identifier"
+    },
+    "session_id": {
+      "type": "string",
+      "pattern": "^sess_[a-z0-9]{24}$",
+      "description": "Session identifier"
+    },
+    "client_id": {
+      "type": "string",
+      "pattern": "^cli_[a-z0-9]{16}$",
+      "description": "Client instance identifier"
+    },
+    "task_id": {
+      "type": ["string", "null"],
+      "pattern": "^task_[a-z0-9]{24}$",
+      "description": "Task identifier (null for session-level messages)"
+    },
+    "message_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique message identifier"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Sender's sequence number"
+    },
+    "ack": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Last received seq from peer"
+    },
+    "timestamp_ms": {
+      "type": "integer",
+      "description": "Unix timestamp in milliseconds"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "maxLength": 128,
+      "description": "Key for replay-safe operations"
+    },
+    "payload": {
+      "type": "object",
+      "description": "Message-type-specific payload"
+    }
+  },
+  "definitions": {
+    "session_start_payload": {
+      "type": "object",
+      "required": ["workspace_label", "client_version"],
+      "properties": {
+        "workspace_label": { "type": "string" },
+        "repo_fingerprint": { "type": "string" },
+        "branch_name": { "type": "string" },
+        "client_version": { "type": "string" },
+        "capabilities": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "session_ready_payload": {
+      "type": "object",
+      "required": ["session_id", "user_id", "plan_tier"],
+      "properties": {
+        "session_id": { "type": "string" },
+        "user_id": { "type": "string" },
+        "plan_tier": {
+          "type": "string",
+          "enum": ["free", "pro", "team", "enterprise"]
+        },
+        "session_caps": {
+          "type": "object",
+          "properties": {
+            "max_concurrent_tasks": { "type": "integer" },
+            "max_retries": { "type": "integer" }
+          }
+        },
+        "server_time_ms": { "type": "integer" }
+      }
+    },
+    "task_start_payload": {
+      "type": "object",
+      "required": ["prompt"],
+      "properties": {
+        "prompt": { "type": "string" },
+        "context": {
+          "type": "object",
+          "properties": {
+            "cwd": { "type": "string" },
+            "active_files": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "git_status": { "type": "object" },
+            "available_validations": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "tool_request_payload": {
+      "type": "object",
+      "required": ["tool_id", "tool_name", "args"],
+      "properties": {
+        "tool_id": { "type": "string" },
+        "tool_name": { "type": "string" },
+        "args": { "type": "object" },
+        "requires_approval": { "type": "boolean", "default": false }
+      }
+    },
+    "tool_result_payload": {
+      "type": "object",
+      "required": ["tool_id", "status"],
+      "properties": {
+        "tool_id": { "type": "string" },
+        "status": {
+          "type": "string",
+          "enum": ["success", "error", "timeout", "cancelled"]
+        },
+        "result": { "type": "object" },
+        "duration_ms": { "type": "integer" },
+        "output_truncated": { "type": "boolean" }
+      }
+    }
+  }
+}

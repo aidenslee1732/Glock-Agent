@@ -1,0 +1,40 @@
+{
+  "name": "glock",
+  "version": "1.0.0",
+  "description": "AI coding assistant CLI",
+  "bin": {
+    "glock": "./packages/glock-npm/bin/glock.js"
+  },
+  "scripts": {
+    "postinstall": "node packages/glock-npm/scripts/postinstall.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/glock/glock.git"
+  },
+  "keywords": [
+    "ai",
+    "coding",
+    "assistant",
+    "cli",
+    "glock"
+  ],
+  "author": "Glock Team",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/glock/glock/issues"
+  },
+  "homepage": "https://glock.dev"
+}
