@@ -152,8 +152,8 @@ class ContextPacker:
                             context=args.get("pattern", ""),
                             priority=2,
                         ))
-                    except (ValueError, IndexError):
-                        pass
+                    except (ValueError, IndexError) as e:
+                        logger.debug(f"Failed to parse grep result line '{line}': {e}")
 
         elif tool_name == "read_file":
             file_path = args.get("file_path", "")

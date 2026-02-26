@@ -152,7 +152,7 @@ class WebSocketClient:
             # Connect WebSocket
             self._ws = await websockets.connect(
                 f"{self.config.server_url}/ws/client",
-                extra_headers=self._get_headers(),
+                additional_headers=self._get_headers(),
             )
 
             # Start receive task
@@ -202,7 +202,7 @@ class WebSocketClient:
             # Connect WebSocket
             self._ws = await websockets.connect(
                 f"{self.config.server_url}/ws/client",
-                extra_headers=self._get_headers(),
+                additional_headers=self._get_headers(),
             )
 
             # Start receive task
@@ -565,8 +565,7 @@ class WebSocketClient:
             request_id=msg.payload.get("request_id", ""),
             delta_type=msg.payload.get("delta_type", "text"),
             content=msg.payload.get("content", ""),
-            tool_call=msg.payload.get("tool_call"),
-            token_count=msg.payload.get("token_count", 0),
+            index=msg.payload.get("index", 0),
         )
 
         if self._llm_delta_handler:
@@ -579,26 +578,27 @@ class WebSocketClient:
 
     async def _handle_llm_response_end(self, msg: MessageEnvelope) -> None:
         """Handle LLM response completion."""
-        # Parse tool call results if present
-        tool_call_results = None
-        if msg.payload.get("tool_call_results"):
+        # Parse tool calls if present
+        tool_calls = []
+        if msg.payload.get("tool_calls"):
             from packages.shared_protocol.types import ToolCallResult
-            tool_call_results = [
+            tool_calls = [
                 ToolCallResult(
                     tool_call_id=r.get("tool_call_id", ""),
                     tool_name=r.get("tool_name", ""),
-                    args=r.get("args", {}),
+                    arguments=r.get("arguments", {}),
                 )
-                for r in msg.payload.get("tool_call_results", [])
+                for r in msg.payload.get("tool_calls", [])
             ]
 
         payload = LLMResponseEndPayload(
             request_id=msg.payload.get("request_id", ""),
-            new_context_ref=msg.payload.get("new_context_ref"),
+            new_context_ref=msg.payload.get("new_context_ref", ""),
             finish_reason=msg.payload.get("finish_reason", "stop"),
-            total_input_tokens=msg.payload.get("total_input_tokens", 0),
-            total_output_tokens=msg.payload.get("total_output_tokens", 0),
-            tool_call_results=tool_call_results,
+            input_tokens=msg.payload.get("input_tokens", 0),
+            output_tokens=msg.payload.get("output_tokens", 0),
+            tool_calls=tool_calls,
+            content=msg.payload.get("content", ""),
         )
 
         # Complete pending request future if exists

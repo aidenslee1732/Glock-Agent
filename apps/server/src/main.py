@@ -12,6 +12,7 @@ import asyncio
 import logging
 import os
 import secrets
+import time
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
@@ -110,6 +111,81 @@ class MockRedisClient:
     async def update_presence(self, session_id: str, gateway_id: str, status: str):
         pass
 
+    async def check_rate_limit(self, user_id: str, per_minute: int, per_hour: int) -> tuple[bool, str]:
+        """Mock rate limit check - always allow in dev mode."""
+        return True, ""
+
+    async def count_user_sessions(self, user_id: str) -> int:
+        """Count user sessions."""
+        count = 0
+        for key in self._data:
+            if key.startswith(f"user:{user_id}:sessions"):
+                count += len(self._data[key]) if isinstance(self._data[key], (list, set)) else 1
+        return count
+
+    async def add_user_session(self, user_id: str, session_id: str):
+        """Add session to user's session list."""
+        key = f"user:{user_id}:sessions"
+        if key not in self._data:
+            self._data[key] = set()
+        self._data[key].add(session_id)
+
+    async def remove_user_session(self, user_id: str, session_id: str):
+        """Remove session from user's session list."""
+        key = f"user:{user_id}:sessions"
+        if key in self._data and isinstance(self._data[key], set):
+            self._data[key].discard(session_id)
+
+    async def increment_rate_counters(self, user_id: str):
+        """Increment rate limit counters - no-op in dev mode."""
+        pass
+
+    async def set_session_state(self, session_id: str, state: dict):
+        """Set session state."""
+        key = f"sess:{session_id}:state"
+        if key not in self._data:
+            self._data[key] = {}
+        self._data[key].update(state)
+
+    async def setex(self, key: str, ttl: int, value: str):
+        """Set with expiry."""
+        self._data[key] = value
+
+    async def lpush(self, key: str, value: str):
+        """Push to list."""
+        if key not in self._data:
+            self._data[key] = []
+        self._data[key].insert(0, value)
+
+    async def ltrim(self, key: str, start: int, end: int):
+        """Trim list."""
+        if key in self._data and isinstance(self._data[key], list):
+            self._data[key] = self._data[key][start:end + 1]
+
+    async def llen(self, key: str) -> int:
+        """Get list length."""
+        if key in self._data and isinstance(self._data[key], list):
+            return len(self._data[key])
+        return 0
+
+    async def lrange(self, key: str, start: int, end: int) -> list:
+        """Get list range."""
+        if key in self._data and isinstance(self._data[key], list):
+            if end == -1:
+                return self._data[key][start:]
+            return self._data[key][start:end + 1]
+        return []
+
+    async def hincrby(self, key: str, field: str, amount: int) -> int:
+        """Increment hash field by amount."""
+        if key not in self._data:
+            self._data[key] = {}
+        if not isinstance(self._data[key], dict):
+            self._data[key] = {}
+        current = int(self._data[key].get(field, 0))
+        self._data[key][field] = str(current + amount)
+        return current + amount
+
 
 class MockPostgresClient:
     """In-memory mock Postgres for dev mode."""
@@ -127,12 +203,24 @@ class MockPostgresClient:
     async def close(self):
         pass
 
-    async def create_session(self, user_id: str, workspace_label: str) -> str:
-        session_id = f"sess_{secrets.token_hex(8)}"
+    async def create_session(
+        self,
+        session_id: str = None,
+        user_id: str = None,
+        client_id: str = None,
+        workspace_label: str = None,
+        repo_fingerprint: str = None,
+        branch_name: str = None,
+    ) -> str:
+        if session_id is None:
+            session_id = f"sess_{secrets.token_hex(8)}"
         self._sessions[session_id] = {
             "id": session_id,
             "user_id": user_id,
+            "client_id": client_id,
             "workspace_label": workspace_label,
+            "repo_fingerprint": repo_fingerprint,
+            "branch_name": branch_name,
             "status": "active",
         }
         return session_id
@@ -150,6 +238,11 @@ class MockPostgresClient:
     async def end_session(self, session_id: str):
         if session_id in self._sessions:
             self._sessions[session_id]["status"] = "ended"
+
+    async def touch_session(self, session_id: str):
+        """Update session last activity timestamp."""
+        if session_id in self._sessions:
+            self._sessions[session_id]["last_activity"] = time.time()
 
     async def create_task(self, session_id: str, prompt: str) -> str:
         task_id = f"task_{secrets.token_hex(8)}"
@@ -226,23 +319,12 @@ async def lifespan(app: FastAPI):
     router = SessionRouter(redis_client, GATEWAY_ID)
     replay_manager = ReplayManager(redis_client)
 
-    # Model B: Initialize LLM handler and checkpoint store
+    # Model B: Initialize LLM handler
     try:
         from apps.server.src.gateway.ws.llm_handler import LLMHandler
-        from apps.server.src.storage.checkpoint_store import ContextCheckpointStore
-        from apps.server.src.context.rehydrator import ContextRehydrator
-
-        master_key = os.environ.get("CONTEXT_MASTER_KEY", "0" * 64)
-        checkpoint_store = ContextCheckpointStore(
-            db=postgres_client,
-            master_key=bytes.fromhex(master_key),
-        )
-
-        rehydrator = ContextRehydrator(checkpoint_store=checkpoint_store)
 
         llm_handler = LLMHandler(
-            checkpoint_store=checkpoint_store,
-            rehydrator=rehydrator,
+            redis=redis_client,
             postgres=postgres_client,
         )
         logger.info("Model B LLM handler initialized")

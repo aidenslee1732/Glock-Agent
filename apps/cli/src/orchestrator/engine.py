@@ -219,11 +219,11 @@ class OrchestrationEngine:
             self._context_ref = payload.new_context_ref
 
             # Parse tool calls
-            if payload.tool_call_results:
-                self._response_tool_calls = payload.tool_call_results
+            if payload.tool_calls:
+                self._response_tool_calls = payload.tool_calls
 
             # Update token count
-            self._total_tokens += payload.total_input_tokens + payload.total_output_tokens
+            self._total_tokens += payload.input_tokens + payload.output_tokens
 
             # Signal response complete
             self._response_event.set()

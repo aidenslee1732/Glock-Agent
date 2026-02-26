@@ -621,8 +621,8 @@ class SessionHost:
 
             # Update tokens
             if self._current_task:
-                self._current_task.input_tokens += payload.total_input_tokens
-                self._current_task.output_tokens += payload.total_output_tokens
+                self._current_task.input_tokens += payload.input_tokens
+                self._current_task.output_tokens += payload.output_tokens
                 self._current_task.tokens_used = (
                     self._current_task.input_tokens + self._current_task.output_tokens
                 )

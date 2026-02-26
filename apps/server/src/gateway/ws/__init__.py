@@ -1,15 +1,13 @@
-"""WebSocket handlers for gateway."""
+"""WebSocket handlers for gateway (Model B - Client Orchestrated)."""
 
 from .client_handler import ClientHandler
-from .runtime_handler import RuntimeHandler
-from .relay import MessageRelay
-from .replay import ReplayBuffer
+from .llm_handler import LLMHandler
+from .replay import ReplayManager
 from .router import SessionRouter
 
 __all__ = [
     "ClientHandler",
-    "RuntimeHandler",
-    "MessageRelay",
-    "ReplayBuffer",
+    "LLMHandler",
+    "ReplayManager",
     "SessionRouter",
 ]

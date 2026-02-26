@@ -13,7 +13,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Optional, Dict, List, Any, Set
+from typing import Optional, Dict, List, Any, Set, Tuple
 from collections import defaultdict
 
 from ..storage.redis import RedisClient
@@ -203,8 +203,12 @@ class MemoryManager:
         prefs: UserPreferences
     ) -> None:
         """Save preferences to database."""
-        # This would update the user_preferences table
-        pass
+        # Store in Redis as the authoritative source for dev mode
+        # In production, this would update the user_preferences table
+        await self.redis.set(
+            f"prefs_db:{user_id}",
+            json.dumps(prefs.to_dict())
+        )
 
     # Preference learning
 

@@ -67,9 +67,14 @@ install_deps() {
     echo "Installing dependencies..."
     pip install --upgrade pip
 
+    # Install from requirements.txt
+    if [ -f "$PROJECT_DIR/requirements.txt" ]; then
+        pip install -r "$PROJECT_DIR/requirements.txt"
+    fi
+
     # Install shared protocol
-    if [ -d "$PROJECT_DIR/packages/shared-protocol" ]; then
-        pip install -e "$PROJECT_DIR/packages/shared-protocol"
+    if [ -d "$PROJECT_DIR/packages/shared_protocol" ]; then
+        pip install -e "$PROJECT_DIR/packages/shared_protocol"
     fi
 
     # Install server
@@ -81,9 +86,6 @@ install_deps() {
     if [ -d "$PROJECT_DIR/apps/cli" ]; then
         pip install -e "$PROJECT_DIR/apps/cli"
     fi
-
-    # Install test dependencies
-    pip install pytest pytest-asyncio pytest-cov
 }
 
 # Start local services (Redis, PostgreSQL)
@@ -141,6 +143,13 @@ run_migrations() {
 # Start in DEV MODE (no Redis/DB/Auth required)
 start_dev_mode() {
     setup_venv
+
+    # Install dependencies if not already installed
+    if ! python -c "import redis" 2>/dev/null; then
+        echo "Installing dependencies..."
+        install_deps
+    fi
+
     check_env
 
     echo -e "${GREEN}Starting in DEV MODE (no Redis/DB/Auth)${NC}"
@@ -185,6 +194,13 @@ start_dev_mode() {
 # Start the server (requires Redis/DB)
 start_server() {
     setup_venv
+
+    # Install dependencies if not already installed
+    if ! python -c "import redis" 2>/dev/null; then
+        echo "Installing dependencies..."
+        install_deps
+    fi
+
     check_env
 
     # Add project root to PYTHONPATH so imports work
@@ -328,6 +344,7 @@ show_help() {
     echo "Commands:"
     echo "  dev             ${GREEN}Start in DEV MODE (no Redis/DB/Auth needed!)${NC}"
     echo "  server          Start the gateway server (requires Redis/DB)"
+    echo "  cli             Start the CLI/TUI client"
     echo "  test            Run all tests"
     echo "  test --coverage Run tests with coverage report"
     echo "  setup           Set up local development environment"
@@ -348,6 +365,24 @@ show_help() {
     echo "  ./run.sh docker         # Use Docker instead"
 }
 
+# Start CLI/TUI client
+start_cli() {
+    setup_venv
+
+    # Install dependencies if not already installed
+    if ! python -c "import textual" 2>/dev/null; then
+        echo "Installing CLI dependencies..."
+        install_deps
+    fi
+
+    echo -e "${GREEN}Starting Glock CLI...${NC}"
+    echo ""
+
+    export PYTHONPATH="$PROJECT_DIR:$PYTHONPATH"
+    cd "$PROJECT_DIR"
+    python -m apps.cli.src.cli.main "${@}"
+}
+
 # Main command handler
 case "${1:-help}" in
     dev)
@@ -355,6 +390,10 @@ case "${1:-help}" in
         ;;
     server|start)
         start_server
+        ;;
+    cli|tui)
+        shift
+        start_cli "$@"
         ;;
     test|tests)
         shift

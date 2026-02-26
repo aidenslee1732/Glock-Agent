@@ -122,9 +122,15 @@ class ClientHandler:
 
             logger.info(f"Client connected: conn={conn_id}, user={user_id}")
 
-            # Message loop
-            async for message in websocket:
-                await self._handle_message(conn_id, message)
+            # Message loop (FastAPI WebSocket)
+            from starlette.websockets import WebSocketDisconnect
+            while True:
+                try:
+                    message = await websocket.receive_text()
+                    await self._handle_message(conn_id, message)
+                except WebSocketDisconnect:
+                    logger.info(f"Client disconnected normally: conn={conn_id}")
+                    break
 
         except Exception as e:
             logger.error(f"Client connection error: conn={conn_id}, error={e}")
@@ -175,7 +181,8 @@ class ClientHandler:
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON from client: {e}")
         except Exception as e:
-            logger.error(f"Error handling client message: {e}")
+            import traceback
+            logger.error(f"Error handling client message: {e}\n{traceback.format_exc()}")
 
     async def _handle_session_start(
         self,
@@ -216,6 +223,13 @@ class ClientHandler:
         client_id = generate_client_id()
 
         payload = msg.payload
+        logger.debug(f"Session start payload type: {type(payload)}, value: {payload}")
+
+        # Ensure payload is a dict
+        if isinstance(payload, str):
+            import json as json_module
+            payload = json_module.loads(payload)
+
         await self.postgres.create_session(
             session_id=session_id,
             user_id=user_id,
@@ -315,9 +329,8 @@ class ClientHandler:
         conn["session_id"] = session_id
         conn["server_seq"] = resume_seq - 1
 
-        # Re-register with router and relay
+        # Re-register with router (Model B: no relay needed)
         await self.router.attach_client(session_id, conn_id)
-        self.relay.register_client(session_id, conn_id, websocket)
 
         # Update session status
         await self.postgres.update_session_status(session_id, "running")
@@ -351,7 +364,7 @@ class ClientHandler:
             ).to_dict(),
             seq=seq,
         )
-        await websocket.send(json.dumps(resume_msg.to_dict()))
+        await websocket.send_text(json.dumps(resume_msg.to_dict()))
 
         logger.info(
             f"Session resumed: session={session_id}, "
@@ -374,8 +387,7 @@ class ClientHandler:
 
         user_id = conn["user_id"]
 
-        # Notify runtime
-        await self.relay.notify_client_disconnected(session_id)
+        # Model B: No runtime to notify - client handles all orchestration
 
         # Update database
         await self.postgres.end_session(session_id)
@@ -393,7 +405,7 @@ class ClientHandler:
             payload={"ended": True},
             seq=seq,
         )
-        await websocket.send(json.dumps(end_msg.to_dict()))
+        await websocket.send_text(json.dumps(end_msg.to_dict()))
 
         logger.info(f"Session ended: session={session_id}")
 
@@ -422,7 +434,7 @@ class ClientHandler:
             seq=seq,
             ack=conn.get("client_ack", 0),
         )
-        await websocket.send(json.dumps(ack_msg.to_dict()))
+        await websocket.send_text(json.dumps(ack_msg.to_dict()))
 
     # =========================================================================
     # Model B: LLM Proxy Handlers
@@ -434,6 +446,7 @@ class ClientHandler:
         msg: MessageEnvelope,
     ) -> None:
         """Handle LLM request from client (Model B)."""
+        logger.info(f"LLM request received: conn={conn_id}")
         conn = self._connections.get(conn_id)
         if not conn:
             return
@@ -453,7 +466,7 @@ class ClientHandler:
 
         # Create send callback for streaming responses
         async def send_callback(data: str) -> None:
-            await websocket.send(data)
+            await websocket.send_text(data)
 
         # Handle LLM request via LLM handler
         await self.llm_handler.handle_llm_request(
@@ -500,7 +513,7 @@ class ClientHandler:
         websocket = conn["websocket"]
 
         async def send_callback(data: str) -> None:
-            await websocket.send(data)
+            await websocket.send_text(data)
 
         await self.llm_handler.handle_context_checkpoint(
             session_id=session_id,
@@ -602,7 +615,7 @@ class ClientHandler:
             payload=sync_payload.to_dict(),
             seq=seq,
         )
-        await websocket.send(json.dumps(sync_msg.to_dict()))
+        await websocket.send_text(json.dumps(sync_msg.to_dict()))
 
         logger.info(
             f"Session resumed (Model B): session={session_id}, "
@@ -762,7 +775,7 @@ class ClientHandler:
             payload=payload.to_dict(),
             seq=1,
         )
-        await websocket.send(json.dumps(msg.to_dict()))
+        await websocket.send_text(json.dumps(msg.to_dict()))
 
     async def _send_error(
         self,
@@ -773,4 +786,4 @@ class ClientHandler:
     ) -> None:
         """Send error message to client."""
         msg = GatewayProtocol.create_error(session_id, error_code, message)
-        await websocket.send(json.dumps(msg.to_dict()))
+        await websocket.send_text(json.dumps(msg.to_dict()))

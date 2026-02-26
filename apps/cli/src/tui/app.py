@@ -142,17 +142,38 @@ class GlockTUI:
 
         self.console.print()
 
-        # Show spinner while waiting
-        with self.console.status("[bold orange1]Glock is thinking...[/bold orange1]"):
-            task_id = await self.session.submit_task(prompt)
+        try:
+            # Run task with orchestration (sends LLM_REQUEST messages)
+            async for event in self.session.run_task(prompt):
+                # Handle events from orchestration
+                if event.type.value == "thinking":
+                    self._show_thinking(event.content)
+                elif event.type.value == "text_delta":
+                    self._append_content(event.content)
+                elif event.type.value == "tool_start":
+                    self._show_tool_request({
+                        "tool_name": event.tool_name,
+                        "args": event.args,
+                    })
+                elif event.type.value == "tool_end":
+                    pass  # Tool completed
+                elif event.type.value == "edit_proposal":
+                    self._show_edit_proposal(event)
+                elif event.type.value == "error":
+                    self._show_error(event.message)
+                elif event.type.value == "task_complete":
+                    self._show_completion({
+                        "summary": event.summary,
+                        "files_modified": list(self.session._orchestrator._files_modified) if self.session._orchestrator else [],
+                        "total_tokens": self.session._orchestrator._total_tokens if self.session._orchestrator else 0,
+                    })
 
-        # Wait for task to complete
-        while self.session.state == SessionState.TASK_RUNNING:
-            await asyncio.sleep(0.1)
+                # Check for approval needed
+                if self.session.state == SessionState.WAITING_APPROVAL:
+                    await self._handle_approval()
 
-            # Check for approval needed
-            if self.session.state == SessionState.WAITING_APPROVAL:
-                await self._handle_approval()
+        except Exception as e:
+            self._show_error(str(e))
 
         self.console.print()
 
@@ -263,6 +284,17 @@ class GlockTUI:
                 f"[bold]{tool_name}[/bold]\n{self._format_args(args)}",
                 title="[teal]Tool Request[/teal]",
                 border_style=GLOCK_TEAL,
+            )
+        )
+
+    def _show_edit_proposal(self, event) -> None:
+        """Show edit proposal."""
+        self.console.print()
+        self.console.print(
+            Panel(
+                f"[bold]{event.file_path}[/bold]\n\n{event.diff or event.new_content[:200]}",
+                title="[yellow]Edit Proposal[/yellow]",
+                border_style="yellow",
             )
         )
 
