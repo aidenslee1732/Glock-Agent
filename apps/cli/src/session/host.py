@@ -50,6 +50,7 @@ from apps.cli.src.planning.mode import PlanMode
 from apps.cli.src.hooks.manager import HookManager
 from apps.cli.src.mcp.tools import MCPToolProxy
 from apps.cli.src.mcp.discovery import MCPServerDiscovery
+from apps.cli.src.mcp.client import MCPClient
 
 logger = logging.getLogger(__name__)
 
@@ -159,12 +160,12 @@ class SessionHost:
 
         # New subsystem initialization
         # Task management
-        self._task_manager = TaskManager(
-            db_path=Path.home() / ".glock" / "tasks.db"
-        )
+        from ..tasks.store import TaskStore
+        task_store = TaskStore(db_path=str(Path.home() / ".glock" / "tasks.db"))
+        self._task_manager = TaskManager(store=task_store)
         self._background_runner = BackgroundTaskRunner(
-            task_manager=self._task_manager,
-            output_dir=Path.home() / ".glock" / "task_outputs",
+            store=task_store,
+            output_dir=str(Path.home() / ".glock" / "task_outputs"),
         )
 
         # Agent system
@@ -332,26 +333,24 @@ class SessionHost:
                 master_token=self.config.auth_token,
             )
 
-        # Initialize MCP proxy with discovered servers (with timeout)
+        # Initialize MCP proxy (optional - don't fail if no MCP servers configured)
         try:
-            mcp_servers = await asyncio.wait_for(
-                self._mcp_discovery.discover_servers(),
-                timeout=30.0,  # 30 second timeout for MCP discovery
+            self._mcp_proxy = MCPToolProxy(
+                discovery=self._mcp_discovery,
+                client=MCPClient(),
             )
-            if mcp_servers:
-                self._mcp_proxy = MCPToolProxy(servers=mcp_servers)
-                await asyncio.wait_for(
-                    self._mcp_proxy.connect_all(),
-                    timeout=60.0,  # 60 second timeout for MCP connections
-                )
-        except asyncio.TimeoutError as e:
-            logger.error(f"MCP initialization timed out: {e}")
-            raise RuntimeError(
-                "MCP server initialization timed out. Check MCP server configuration."
-            ) from e
+            # Try to initialize but don't fail if no servers
+            connected = await asyncio.wait_for(
+                self._mcp_proxy.initialize(),
+                timeout=30.0,
+            )
+            logger.info(f"MCP initialized: {connected} servers connected")
+        except asyncio.TimeoutError:
+            logger.warning("MCP initialization timed out - continuing without MCP")
+            self._mcp_proxy = None
         except Exception as e:
-            logger.error(f"MCP initialization failed: {e}")
-            raise RuntimeError(f"Failed to initialize MCP servers: {e}") from e
+            logger.warning(f"MCP initialization failed: {e} - continuing without MCP")
+            self._mcp_proxy = None
 
         # Update tool broker with new subsystems
         self._tools.set_task_manager(self._task_manager)
@@ -421,26 +420,23 @@ class SessionHost:
                 master_token=self.config.auth_token,
             )
 
-        # Initialize MCP proxy with discovered servers (with timeout)
+        # Initialize MCP proxy (optional - don't fail if no MCP servers configured)
         try:
-            mcp_servers = await asyncio.wait_for(
-                self._mcp_discovery.discover_servers(),
-                timeout=30.0,  # 30 second timeout for MCP discovery
+            self._mcp_proxy = MCPToolProxy(
+                discovery=self._mcp_discovery,
+                client=MCPClient(),
             )
-            if mcp_servers:
-                self._mcp_proxy = MCPToolProxy(servers=mcp_servers)
-                await asyncio.wait_for(
-                    self._mcp_proxy.connect_all(),
-                    timeout=60.0,  # 60 second timeout for MCP connections
-                )
-        except asyncio.TimeoutError as e:
-            logger.error(f"MCP initialization timed out during resume: {e}")
-            raise RuntimeError(
-                "MCP server initialization timed out. Check MCP server configuration."
-            ) from e
+            connected = await asyncio.wait_for(
+                self._mcp_proxy.initialize(),
+                timeout=30.0,
+            )
+            logger.info(f"MCP initialized during resume: {connected} servers connected")
+        except asyncio.TimeoutError:
+            logger.warning("MCP initialization timed out during resume - continuing without MCP")
+            self._mcp_proxy = None
         except Exception as e:
-            logger.error(f"MCP initialization failed during resume: {e}")
-            raise RuntimeError(f"Failed to initialize MCP servers: {e}") from e
+            logger.warning(f"MCP initialization failed during resume: {e} - continuing without MCP")
+            self._mcp_proxy = None
 
         # Update tool broker with new subsystems
         self._tools.set_task_manager(self._task_manager)
