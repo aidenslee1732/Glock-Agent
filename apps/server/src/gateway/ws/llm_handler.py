@@ -16,34 +16,30 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Optional, AsyncIterator
+from typing import Any, Optional, Callable, Awaitable
 from uuid import uuid4
 
 from packages.shared_protocol.types import (
     MessageEnvelope,
     MessageType,
-    LLMRequestPayload,
     LLMDeltaPayload,
     LLMResponseEndPayload,
     LLMErrorPayload,
-    LLMCancelPayload,
-    ContextCheckpointPayload,
     ContextCheckpointAckPayload,
     ToolCallResult,
-    ContextPack,
-    ContextDelta,
-    Message,
     generate_checkpoint_id,
 )
 from apps.server.src.storage.redis import RedisClient
 from apps.server.src.storage.postgres import PostgresClient
+from apps.server.src.storage.checkpoint_store import ContextCheckpointStore
 from apps.server.src.planner.llm.gateway import (
     LLMGateway,
     LLMConfig,
     ModelTier,
     Message as LLMMessage,
+    ToolCallMessage,
+    FunctionCall,
     ToolDefinition as LLMToolDefinition,
-    StreamDelta,
     LLMError,
 )
 
@@ -83,15 +79,14 @@ class LLMHandler:
         redis: RedisClient,
         postgres: PostgresClient,
         llm_gateway: Optional[LLMGateway] = None,
+        checkpoint_store: Optional[ContextCheckpointStore] = None,
     ):
         self.redis = redis
         self.postgres = postgres
         self.llm_gateway = llm_gateway or LLMGateway(LLMConfig())
+        self.checkpoint_store = checkpoint_store or ContextCheckpointStore(postgres, redis)
 
-        # Active requests: request_id → ActiveRequest
         self._active_requests: dict[str, ActiveRequest] = {}
-
-        # Cancel signals: request_id → asyncio.Event
         self._cancel_events: dict[str, asyncio.Event] = {}
 
     async def handle_llm_request(
@@ -99,20 +94,11 @@ class LLMHandler:
         session_id: str,
         user_id: str,
         payload: dict[str, Any],
-        send_callback: Any,  # async callable to send messages
+        send_callback: Callable[[str], Awaitable[None]],
     ) -> None:
-        """
-        Handle an LLM request from a client.
-
-        Args:
-            session_id: The session ID
-            user_id: The authenticated user ID
-            payload: The LLM request payload
-            send_callback: Async function to send messages back to client
-        """
+        """Handle an LLM request from a client."""
         request_id = payload.get("request_id", str(uuid4()))
 
-        # Track active request
         active_request = ActiveRequest(
             request_id=request_id,
             session_id=session_id,
@@ -123,7 +109,6 @@ class LLMHandler:
         self._cancel_events[request_id] = asyncio.Event()
 
         try:
-            # Parse request payload
             context_ref = payload.get("context_ref")
             delta_data = payload.get("delta", {})
             context_pack_data = payload.get("context_pack", {})
@@ -132,7 +117,6 @@ class LLMHandler:
             max_tokens = payload.get("max_tokens", 8192)
             temperature = payload.get("temperature", 0.7)
 
-            # Build messages from context
             messages = await self._build_messages(
                 session_id=session_id,
                 user_id=user_id,
@@ -141,13 +125,9 @@ class LLMHandler:
                 context_pack=context_pack_data,
             )
 
-            # Build tools
             tools = self._build_tools(tools_data)
-
-            # Get model tier
             tier = self._parse_model_tier(model_tier)
 
-            # Stream LLM response
             total_content = ""
             tool_calls: list[ToolCallResult] = []
             input_tokens = 0
@@ -155,7 +135,6 @@ class LLMHandler:
             finish_reason = "stop"
             index = 0
 
-            # Accumulate tool call data for parsing
             current_tool_id: Optional[str] = None
             current_tool_name: Optional[str] = None
             current_tool_args: str = ""
@@ -169,12 +148,10 @@ class LLMHandler:
                 user_id=user_id,
                 session_id=session_id,
             ):
-                # Check for cancellation
                 if self._cancel_events[request_id].is_set():
                     finish_reason = "cancelled"
                     break
 
-                # Send delta to client
                 if delta.content:
                     total_content += delta.content
                     await self._send_delta(
@@ -187,11 +164,8 @@ class LLMHandler:
                     )
                     index += 1
 
-                # Handle tool calls
                 if delta.tool_call_id:
-                    # New tool call starting
                     if current_tool_id and current_tool_name:
-                        # Save previous tool call
                         try:
                             args = json.loads(current_tool_args) if current_tool_args else {}
                         except json.JSONDecodeError:
@@ -213,7 +187,6 @@ class LLMHandler:
                     if finish_reason == "tool_calls":
                         finish_reason = "tool_use"
 
-            # Save final tool call if any
             if current_tool_id and current_tool_name:
                 try:
                     args = json.loads(current_tool_args) if current_tool_args else {}
@@ -225,16 +198,13 @@ class LLMHandler:
                     arguments=args,
                 ))
 
-            # Estimate token usage (LiteLLM provides this in final chunk sometimes)
             input_tokens = self.llm_gateway.estimate_tokens(
                 json.dumps([m.to_dict() for m in messages])
             )
             output_tokens = self.llm_gateway.estimate_tokens(total_content)
 
-            # Create new checkpoint
             new_context_ref = generate_checkpoint_id()
 
-            # Send response end
             await self._send_response_end(
                 send_callback=send_callback,
                 session_id=session_id,
@@ -247,7 +217,6 @@ class LLMHandler:
                 content=total_content,
             )
 
-            # Update session state in Redis
             await self._update_session_state(
                 session_id=session_id,
                 context_ref=new_context_ref,
@@ -288,7 +257,6 @@ class LLMHandler:
             )
 
         finally:
-            # Cleanup
             self._active_requests.pop(request_id, None)
             self._cancel_events.pop(request_id, None)
 
@@ -311,13 +279,9 @@ class LLMHandler:
         session_id: str,
         user_id: str,
         payload: dict[str, Any],
-        send_callback: Any,
+        send_callback: Callable[[str], Awaitable[None]],
     ) -> None:
-        """
-        Handle context checkpoint from client.
-
-        Stores the encrypted checkpoint and acknowledges.
-        """
+        """Handle context checkpoint from client."""
         checkpoint_id = payload.get("checkpoint_id")
         parent_id = payload.get("parent_id")
         encrypted_payload = payload.get("encrypted_payload")
@@ -331,7 +295,6 @@ class LLMHandler:
             return
 
         try:
-            # Store checkpoint in database
             expires_at = datetime.utcnow() + timedelta(hours=CHECKPOINT_TTL_HOURS)
 
             await self.postgres.execute(
@@ -356,7 +319,6 @@ class LLMHandler:
                 expires_at,
             )
 
-            # Update session state
             await self.redis.hset(
                 f"sess:{session_id}:state",
                 mapping={
@@ -366,7 +328,6 @@ class LLMHandler:
                 },
             )
 
-            # Send acknowledgment
             stored_at = datetime.utcnow()
             ack_payload = ContextCheckpointAckPayload(
                 checkpoint_id=checkpoint_id,
@@ -388,6 +349,28 @@ class LLMHandler:
 
         except Exception as e:
             logger.exception(f"Failed to store checkpoint {checkpoint_id}")
+            # Store error in database and raise user-friendly error
+            from apps.server.src.errors import handle_error, ErrorContext, GlockError
+            try:
+                import asyncio
+                asyncio.create_task(handle_error(
+                    e,
+                    component="llm_handler.checkpoint",
+                    context=ErrorContext(
+                        session_id=session_id,
+                        user_id=user_id,
+                        additional={"checkpoint_id": checkpoint_id},
+                    ),
+                    reraise=False,
+                ))
+            except Exception:
+                pass  # Don't fail if error storage fails
+            raise GlockError(
+                f"Failed to store checkpoint {checkpoint_id}: {e}",
+                original_error=e,
+                severity="critical",
+                context=ErrorContext(session_id=session_id, user_id=user_id),
+            ) from e
 
     async def _build_messages(
         self,
@@ -400,10 +383,9 @@ class LLMHandler:
         """
         Build LLM messages from context checkpoint, delta, and context pack.
 
-        In Model B, context is assembled from:
-        1. System prompt (built from context_pack)
-        2. Rehydrated messages from checkpoint (if context_ref provided)
-        3. Delta messages (new since last checkpoint)
+        Ensures proper message ordering for tool calls:
+        - Assistant messages with tool_calls must be followed by tool result messages
+        - Tool result messages must reference valid tool_call_ids from the preceding assistant
         """
         messages: list[LLMMessage] = []
 
@@ -421,26 +403,149 @@ class LLMHandler:
             )
             messages.extend(checkpoint_messages)
 
-        # 3. Add delta messages
+        # 3. Process delta messages and tool results together to maintain proper ordering
         delta_messages = delta.get("messages", [])
+        tool_results = delta.get("tool_results_compressed", [])
+
+        # Build a map of tool_call_id to tool result for quick lookup
+        tool_results_by_id: dict[str, dict[str, Any]] = {
+            result.get("tool_call_id"): result
+            for result in tool_results
+            if result.get("tool_call_id")
+        }
+
+        # Track which tool results we've added
+        added_tool_result_ids: set[str] = set()
+
         for msg_data in delta_messages:
             role = msg_data.get("role", "user")
-            content = msg_data.get("content", "")
-            messages.append(LLMMessage(role=role, content=content))
+            content = msg_data.get("content")
+            raw_tool_calls = msg_data.get("tool_calls")
 
-        # 4. Add compressed tool results
-        tool_results = delta.get("tool_results_compressed", [])
-        for result in tool_results:
-            tool_content = json.dumps(result, indent=2)
-            messages.append(LLMMessage(role="tool", content=tool_content))
+            # Convert tool_calls to proper format if present
+            tool_calls: Optional[list[ToolCallMessage]] = None
+            if raw_tool_calls and role == "assistant":
+                tool_calls = self._convert_tool_calls(raw_tool_calls)
+
+            messages.append(LLMMessage(
+                role=role,
+                content=content,
+                tool_calls=tool_calls,
+            ))
+
+            # If this assistant message has tool_calls, add corresponding tool results right after
+            if tool_calls:
+                for tc in tool_calls:
+                    if tc.id in tool_results_by_id and tc.id not in added_tool_result_ids:
+                        result = tool_results_by_id[tc.id]
+                        tool_content = self._format_tool_result_content(result)
+                        messages.append(LLMMessage(
+                            role="tool",
+                            content=tool_content,
+                            tool_call_id=tc.id,
+                        ))
+                        added_tool_result_ids.add(tc.id)
+
+        # 4. Handle remaining tool results that weren't matched to an assistant message
+        # We MUST create an assistant message with tool_calls before adding tool results
+        # Otherwise the API will reject with "unexpected tool_use_id" error
+        unmatched_results = [
+            result for result in tool_results
+            if result.get("tool_call_id") and result.get("tool_call_id") not in added_tool_result_ids
+        ]
+
+        if unmatched_results:
+            logger.warning(
+                f"Found {len(unmatched_results)} tool results without matching assistant tool_calls. "
+                "Reconstructing assistant message."
+            )
+
+            # Create tool_calls for the assistant message from the unmatched results
+            reconstructed_tool_calls: list[ToolCallMessage] = []
+            for result in unmatched_results:
+                tool_call_id = result.get("tool_call_id", "")
+                tool_name = result.get("tool_name", "unknown_tool")
+
+                reconstructed_tool_calls.append(ToolCallMessage(
+                    id=tool_call_id,
+                    type="function",
+                    function=FunctionCall(
+                        name=tool_name,
+                        arguments="{}",  # We don't have the original arguments
+                    ),
+                ))
+
+            # Add the reconstructed assistant message with tool_calls
+            messages.append(LLMMessage(
+                role="assistant",
+                content=None,  # Assistant messages with tool_calls can have null content
+                tool_calls=reconstructed_tool_calls,
+            ))
+
+            # Now add the tool results
+            for result in unmatched_results:
+                tool_call_id = result.get("tool_call_id")
+                tool_content = self._format_tool_result_content(result)
+                messages.append(LLMMessage(
+                    role="tool",
+                    content=tool_content,
+                    tool_call_id=tool_call_id,
+                ))
+                added_tool_result_ids.add(tool_call_id)
 
         return messages
+
+    def _convert_tool_calls(
+        self,
+        raw_tool_calls: list[dict[str, Any]],
+    ) -> list[ToolCallMessage]:
+        """Convert raw tool call dicts to ToolCallMessage objects."""
+        tool_calls: list[ToolCallMessage] = []
+
+        for tc in raw_tool_calls:
+            # Handle both OpenAI format and simplified format
+            tc_id = tc.get("id") or tc.get("tool_call_id", "")
+
+            # Get function details
+            function_data = tc.get("function", {})
+            if function_data:
+                name = function_data.get("name", "")
+                arguments = function_data.get("arguments", "{}")
+            else:
+                # Simplified format: name and arguments at top level
+                name = tc.get("name", tc.get("tool_name", ""))
+                arguments = tc.get("arguments", {})
+
+            # Ensure arguments is a JSON string
+            if isinstance(arguments, dict):
+                arguments = json.dumps(arguments)
+
+            tool_calls.append(ToolCallMessage(
+                id=tc_id,
+                type="function",
+                function=FunctionCall(name=name, arguments=arguments),
+            ))
+
+        return tool_calls
+
+    def _format_tool_result_content(self, result: dict[str, Any]) -> str:
+        """Format tool result as content string."""
+        # For simple string results, return directly
+        if isinstance(result.get("result"), str) and not result.get("tool_name"):
+            return result["result"]
+
+        # For structured results, format as JSON
+        tool_content_data = {
+            "tool_name": result.get("tool_name"),
+            "status": result.get("status"),
+            "result": result.get("result"),
+        }
+        return json.dumps(tool_content_data, indent=2)
 
     def _build_system_prompt(self, context_pack: dict[str, Any]) -> str:
         """Build system prompt from context pack."""
         parts: list[str] = []
 
-        # Rolling summary
         summary = context_pack.get("rolling_summary", {})
         if summary:
             task_desc = summary.get("task_description", "")
@@ -453,19 +558,17 @@ class LLMHandler:
 
             files_modified = summary.get("files_modified", [])
             if files_modified:
-                parts.append(f"## Files Modified\n" + "\n".join(f"- {f}" for f in files_modified))
+                parts.append("## Files Modified\n" + "\n".join(f"- {f}" for f in files_modified))
 
             key_decisions = summary.get("key_decisions", [])
             if key_decisions:
-                parts.append(f"## Key Decisions\n" + "\n".join(f"- {d}" for d in key_decisions))
+                parts.append("## Key Decisions\n" + "\n".join(f"- {d}" for d in key_decisions))
 
-        # Pinned facts
         facts = context_pack.get("pinned_facts", [])
         if facts:
             facts_text = "\n".join(f"- {f.get('key')}: {f.get('value')}" for f in facts)
             parts.append(f"## Important Facts\n{facts_text}")
 
-        # File slices
         slices = context_pack.get("file_slices", [])
         if slices:
             slice_parts = []
@@ -477,7 +580,7 @@ class LLMHandler:
                 slice_parts.append(
                     f"### {file_path} (lines {start}-{end})\n```\n{content}\n```"
                 )
-            parts.append(f"## Relevant File Context\n" + "\n\n".join(slice_parts))
+            parts.append("## Relevant File Context\n" + "\n\n".join(slice_parts))
 
         return "\n\n".join(parts) if parts else ""
 
@@ -487,16 +590,73 @@ class LLMHandler:
         user_id: str,
         context_ref: str,
     ) -> list[LLMMessage]:
-        """
-        Load and decrypt messages from a checkpoint.
+        """Load and decrypt messages from a checkpoint chain.
 
-        Note: In the full implementation, this would decrypt the checkpoint
-        and walk the delta chain. For now, we return empty as the delta
-        contains the recent messages.
+        Walks the checkpoint chain from the full snapshot to the target
+        checkpoint, rehydrating all messages in order.
+
+        Args:
+            session_id: The session ID
+            user_id: The user ID
+            context_ref: The checkpoint ID to load from
+
+        Returns:
+            List of LLMMessage objects from the checkpoint chain
         """
-        # TODO: Implement checkpoint chain rehydration
-        # This requires the ContextRehydrator which we'll implement next
-        return []
+        messages: list[LLMMessage] = []
+
+        try:
+            # Get the full checkpoint chain (oldest to newest)
+            chain = await self.checkpoint_store.get_checkpoint_chain(
+                checkpoint_id=context_ref,
+                session_id=session_id,
+                user_id=user_id,
+            )
+
+            if not chain:
+                logger.warning(f"No checkpoint chain found for {context_ref}")
+                return []
+
+            # Process each checkpoint in the chain
+            for checkpoint in chain:
+                try:
+                    # Parse the decrypted payload as JSON
+                    payload_data = json.loads(checkpoint.payload.decode("utf-8"))
+
+                    # Extract messages from the payload
+                    checkpoint_messages = payload_data.get("messages", [])
+
+                    for msg_data in checkpoint_messages:
+                        role = msg_data.get("role", "user")
+                        content = msg_data.get("content")
+                        raw_tool_calls = msg_data.get("tool_calls")
+
+                        # Convert tool_calls if present
+                        tool_calls: Optional[list[ToolCallMessage]] = None
+                        if raw_tool_calls and role == "assistant":
+                            tool_calls = self._convert_tool_calls(raw_tool_calls)
+
+                        messages.append(LLMMessage(
+                            role=role,
+                            content=content,
+                            tool_calls=tool_calls,
+                        ))
+
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse checkpoint {checkpoint.id}: {e}")
+                    continue
+
+            logger.debug(
+                f"Rehydrated {len(messages)} messages from checkpoint chain "
+                f"({len(chain)} checkpoints)"
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint messages: {e}")
+            # Return empty list rather than failing the request
+            return []
+
+        return messages
 
     def _build_tools(self, tools_data: list[dict[str, Any]]) -> list[LLMToolDefinition]:
         """Build tool definitions for LLM."""
@@ -521,7 +681,7 @@ class LLMHandler:
 
     async def _send_delta(
         self,
-        send_callback: Any,
+        send_callback: Callable[[str], Awaitable[None]],
         session_id: str,
         request_id: str,
         delta_type: str,
@@ -544,7 +704,7 @@ class LLMHandler:
 
     async def _send_response_end(
         self,
-        send_callback: Any,
+        send_callback: Callable[[str], Awaitable[None]],
         session_id: str,
         request_id: str,
         new_context_ref: str,
@@ -573,7 +733,7 @@ class LLMHandler:
 
     async def _send_error(
         self,
-        send_callback: Any,
+        send_callback: Callable[[str], Awaitable[None]],
         session_id: str,
         request_id: str,
         error_code: str,
@@ -611,7 +771,6 @@ class LLMHandler:
             },
         )
 
-        # Increment total tokens
         await self.redis.hincrby(
             f"sess:{session_id}:state",
             "total_tokens",

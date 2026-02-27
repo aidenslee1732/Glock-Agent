@@ -56,57 +56,27 @@ Glock is a CLI tool that provides AI-assisted coding with:
 | Context storage | Full history sent | **Delta + checkpoints** |
 | Token efficiency | ~100% | **40-60% reduced** |
 
-## Quick Start
-
-### Installation
+## Quick Start (For Users)
 
 ```bash
-# One-line install
-curl -fsSL https://glock.dev/install.sh | bash
+# Install
+curl -fsSL getglock.dev/install.sh | bash
 
-# Or with pip
-pip install glock-cli
-```
-
-### Login & Start
-
-```bash
-# Authenticate (opens browser)
+# Login (opens browser)
 glock login
 
-# Start coding in your project
+# Start coding
 cd my-project
 glock
 
-# Or start with a task
-glock "Fix the authentication bug in login.py"
+# Logout
+glock logout
+
+# Check version
+glock version
 ```
 
-### CLI Commands
-
-```bash
-# Interactive session
-glock                           # Start TUI in current directory
-glock "Your task here"          # Start with initial prompt
-
-# Authentication
-glock login                     # OAuth login flow
-glock logout                    # Clear credentials
-glock whoami                    # Show current user
-
-# Session management
-glock sessions                  # List recent sessions
-glock resume <session_id>       # Resume previous session
-glock sessions --clean          # Clean up old sessions
-
-# Configuration
-glock config                    # Show current config
-glock config set model sonnet   # Set default model (fast/standard/advanced)
-
-# Diagnostics
-glock doctor                    # Check installation & connectivity
-glock version                   # Show version info
-```
+See [USERS.md](USERS.md) for the complete user guide.
 
 ## Development Setup
 

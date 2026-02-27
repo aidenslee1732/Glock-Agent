@@ -27,10 +27,20 @@ textual>=0.47.0
 prompt-toolkit>=3.0.0
 pygments>=2.17.0
 
+# Web tools
+aiohttp>=3.9.0
+beautifulsoup4>=4.12.0
+
 # Testing
 pytest>=7.4.0
 pytest-asyncio>=0.23.0
 pytest-cov>=4.1.0
+
+# PDF processing
+pypdf>=3.0.0
+
+# Image processing (optional)
+pillow>=10.0.0
 
 # Development
 ruff>=0.1.0

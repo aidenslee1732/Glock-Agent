@@ -44,10 +44,12 @@ logger = logging.getLogger(__name__)
 
 
 # Configuration defaults
-MAX_TURNS = 50
+MAX_TURNS = 100
 MAX_TOOL_CALLS_PER_TURN = 30
 DEFAULT_MODEL_TIER = "standard"
 LLM_TIMEOUT_MS = 300000
+MAX_TOTAL_TOKENS = 300000  # Force final response before hitting this
+TOKEN_WARNING_THRESHOLD = 0.85  # Warn at 85% of limit
 
 
 @dataclass
@@ -58,6 +60,8 @@ class OrchestrationConfig:
     max_tool_calls_per_turn: int = MAX_TOOL_CALLS_PER_TURN
     llm_timeout_ms: int = LLM_TIMEOUT_MS
     checkpoint_interval: int = 3  # Save checkpoint every N turns
+    max_total_tokens: int = MAX_TOTAL_TOKENS  # Token budget for task
+    token_warning_threshold: float = TOKEN_WARNING_THRESHOLD  # Force response at this %
 
 
 class EventType(str, Enum):
@@ -280,9 +284,10 @@ class OrchestrationEngine:
         self._rolling_summary.task_description = prompt
         self._rolling_summary.current_state = "Starting task"
 
-        # If using context packer, set the task
+        # If using context packer, set the task and process user message
         if self._context_packer:
             self._context_packer.set_task(prompt)
+            self._context_packer.process_user_message(prompt)
 
         # Add initial user message
         self._turns.append(ConversationTurn(role="user", content=prompt))
@@ -296,14 +301,35 @@ class OrchestrationEngine:
 
         task_complete = False
         error: Optional[str] = None
+        force_final_response = False
+        token_limit = self.config.max_total_tokens
+        token_threshold = self.config.token_warning_threshold
 
         try:
-            while self._turn_count < max_turns and not task_complete:
+            while self._turn_count < max_turns and not task_complete and self._total_tokens < token_limit:
                 self._turn_count += 1
+
+                # Check if we should force final response
+                approaching_turn_limit = self._turn_count >= max_turns - 1
+                approaching_token_limit = self._total_tokens >= (token_limit * token_threshold)
+
+                if approaching_turn_limit or approaching_token_limit:
+                    force_final_response = True
+                    if approaching_token_limit:
+                        logger.info(f"Token limit approaching: {self._total_tokens}/{token_limit} ({self._total_tokens/token_limit*100:.1f}%)")
 
                 # Build context for LLM request
                 context_pack = self._build_context_pack()
                 delta = self._build_delta()
+
+                # If forcing final response, add instruction to summarize
+                if force_final_response:
+                    reason = "Token limit" if approaching_token_limit else "Turn limit"
+                    self._turns.append(ConversationTurn(
+                        role="user",
+                        content=f"[SYSTEM: {reason} approaching. Please provide your final answer now without using any more tools. Summarize your findings and answer the original question directly.]",
+                    ))
+                    delta = self._build_delta()
 
                 # Send LLM request
                 yield OrchestrationEvent(type=EventType.THINKING)
@@ -312,6 +338,7 @@ class OrchestrationEngine:
                     context_pack=context_pack,
                     delta=delta,
                     plan=plan,
+                    force_no_tools=force_final_response,  # Disable tools on final turn
                 )
 
                 if self._response_error:
@@ -329,6 +356,13 @@ class OrchestrationEngine:
                         type=EventType.TEXT_DELTA,
                         content=response_content,
                     )
+
+                    # Process through context packer
+                    if self._context_packer:
+                        self._context_packer.process_assistant_response(
+                            content=response_content,
+                            tool_calls=[tc.to_dict() for tc in tool_calls] if tool_calls else None,
+                        )
 
                     # Add assistant turn
                     self._turns.append(ConversationTurn(
@@ -379,11 +413,15 @@ class OrchestrationEngine:
 
                         # Execute tool
                         try:
-                            result = await self.tools.execute(
+                            tool_result = await self.tools.execute(
                                 tool_call.tool_name,
                                 tool_call.arguments,
                             )
-                            status = "success"
+                            # Extract output from ToolResult dataclass
+                            result = tool_result.output if tool_result.output else {}
+                            status = "success" if tool_result.success else "error"
+                            if tool_result.error:
+                                result = {"error": tool_result.error, "output": result}
 
                             # Track modified files
                             if tool_call.tool_name in ("edit_file", "write_file"):
@@ -412,6 +450,15 @@ class OrchestrationEngine:
                             tool_name=tool_call.tool_name,
                             result=result,
                         )
+
+                        # Process tool result through context packer
+                        if self._context_packer:
+                            self._context_packer.process_tool_result(
+                                tool_call_id=tool_call.tool_call_id,
+                                tool_name=tool_call.tool_name,
+                                args=tool_call.arguments,
+                                result=result if isinstance(result, dict) else {"output": result},
+                            )
 
                         # Add tool result to conversation
                         if self._turns and self._turns[-1].role == "assistant":
@@ -478,9 +525,16 @@ class OrchestrationEngine:
         context_pack: ContextPack,
         delta: ContextDelta,
         plan: Optional[CompiledPlan] = None,
+        force_no_tools: bool = False,
     ) -> tuple[str, list[ToolCallResult]]:
         """
         Send LLM request and wait for response.
+
+        Args:
+            context_pack: The context pack with summary, facts, file slices
+            delta: Recent messages and tool results
+            plan: Optional compiled plan with constraints
+            force_no_tools: If True, don't send tools (forces text response)
 
         Returns:
             Tuple of (response_content, tool_calls)
@@ -495,8 +549,11 @@ class OrchestrationEngine:
         request_id = generate_request_id()
         self._active_request_id = request_id
 
-        # Build tool definitions
-        tools = self._build_tool_definitions(plan)
+        # Build tool definitions (empty if forcing no tools)
+        if force_no_tools:
+            tools = []
+        else:
+            tools = self._build_tool_definitions(plan)
 
         # Send request via WebSocket client
         await self._ws.send_llm_request(
@@ -551,6 +608,12 @@ class OrchestrationEngine:
 
     def _build_context_pack(self) -> ContextPack:
         """Build the stable context pack."""
+        # Use context packer if available
+        if self._context_packer:
+            pack, _ = self._context_packer.build()
+            return pack
+
+        # Fallback to manual building
         return ContextPack(
             rolling_summary=self._rolling_summary,
             pinned_facts=self._pinned_facts,
@@ -560,6 +623,12 @@ class OrchestrationEngine:
 
     def _build_delta(self) -> ContextDelta:
         """Build the delta since last checkpoint."""
+        # Use context packer if available
+        if self._context_packer:
+            _, delta = self._context_packer.build()
+            return delta
+
+        # Fallback to manual building
         # Get recent messages (after checkpoint)
         messages: list[Message] = []
         tool_results: list[dict[str, Any]] = []
@@ -568,10 +637,18 @@ class OrchestrationEngine:
         recent_turns = self._turns[-5:] if len(self._turns) > 5 else self._turns
 
         for turn in recent_turns:
-            messages.append(Message(
-                role=turn.role,
-                content=turn.content,
-            ))
+            # Build message dict with tool_calls if present (for assistant messages)
+            msg_dict = {
+                "role": turn.role,
+                "content": turn.content,
+            }
+
+            # CRITICAL: Include tool_calls for assistant messages
+            # This is required for the Anthropic API to match tool_results
+            if turn.role == "assistant" and turn.tool_calls:
+                msg_dict["tool_calls"] = turn.tool_calls
+
+            messages.append(Message(**msg_dict))
 
             # Include compressed tool results
             for result in turn.tool_results:
@@ -677,6 +754,50 @@ class OrchestrationEngine:
                     "required": [],
                 },
             ),
+            ToolDefinition(
+                name="web_fetch",
+                description="Fetch content from a URL and extract readable text. Use this to read web pages, documentation, articles, or any publicly accessible URL. Returns the text content of the page with HTML stripped.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "The URL to fetch (must be http or https)",
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "Optional: guidance for what information to focus on",
+                        },
+                        "extract_links": {
+                            "type": "boolean",
+                            "description": "Whether to also extract links from the page (default: false)",
+                        },
+                        "max_length": {
+                            "type": "integer",
+                            "description": "Maximum content length to return (default: 50000)",
+                        },
+                    },
+                    "required": ["url"],
+                },
+            ),
+            ToolDefinition(
+                name="web_search",
+                description="Search the web for information. Use this to find relevant URLs, research topics, look up documentation, or discover resources. Returns a list of search results with titles, URLs, and snippets.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The search query",
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Maximum number of results to return (default: 10)",
+                        },
+                    },
+                    "required": ["query"],
+                },
+            ),
         ]
 
         # Filter by plan if provided
@@ -725,26 +846,40 @@ class OrchestrationEngine:
         checkpoint_id = generate_checkpoint_id()
 
         # Build checkpoint payload
-        payload_data = {
-            "messages": [
-                {
-                    "role": turn.role,
-                    "content": turn.content,
-                    "tool_calls": turn.tool_calls,
-                }
-                for turn in self._turns
-            ],
-            "tool_results": [
-                result
-                for turn in self._turns
-                for result in turn.tool_results
-            ],
-            "rolling_summary": self._rolling_summary.to_dict(),
-            "pinned_facts": [f.to_dict() for f in self._pinned_facts],
-            "file_slices": [s.to_dict() for s in self._file_slices],
-            "token_count": self._total_tokens,
-            "turn_count": self._turn_count,
-        }
+        # Use context packer state if available
+        if self._context_packer:
+            packer_state = self._context_packer.serialize_state()
+            payload_data = {
+                "messages": packer_state.get("conversation", []),
+                "tool_results": [],
+                "rolling_summary": packer_state.get("summary", {}),
+                "pinned_facts": packer_state.get("facts", []),
+                "file_slices": [],
+                "slice_requests": packer_state.get("slice_requests", []),
+                "token_count": self._total_tokens,
+                "turn_count": self._turn_count,
+            }
+        else:
+            payload_data = {
+                "messages": [
+                    {
+                        "role": turn.role,
+                        "content": turn.content,
+                        "tool_calls": turn.tool_calls,
+                    }
+                    for turn in self._turns
+                ],
+                "tool_results": [
+                    result
+                    for turn in self._turns
+                    for result in turn.tool_results
+                ],
+                "rolling_summary": self._rolling_summary.to_dict(),
+                "pinned_facts": [f.to_dict() for f in self._pinned_facts],
+                "file_slices": [s.to_dict() for s in self._file_slices],
+                "token_count": self._total_tokens,
+                "turn_count": self._turn_count,
+            }
 
         # Serialize payload
         payload_bytes = json.dumps(payload_data).encode()
@@ -755,9 +890,20 @@ class OrchestrationEngine:
 
         # Encrypt with session key if available
         if self._key_manager:
-            encrypted_payload = self._key_manager.encrypt_checkpoint(payload_bytes)
+            try:
+                encrypted_payload = self._key_manager.encrypt_checkpoint(payload_bytes)
+            except Exception as e:
+                logger.error(f"Failed to encrypt checkpoint: {e}")
+                raise RuntimeError(
+                    f"Checkpoint encryption failed - cannot save session state securely: {e}"
+                ) from e
         else:
-            # Fallback: just use raw bytes (not recommended for production)
+            # SECURITY WARNING: No encryption available
+            # This should only happen in development/testing
+            logger.warning(
+                "SECURITY WARNING: Saving checkpoint WITHOUT encryption. "
+                "This is not recommended for production use."
+            )
             encrypted_payload = payload_bytes
 
         # Send checkpoint via WebSocket client
@@ -771,6 +917,11 @@ class OrchestrationEngine:
         )
 
         self._context_ref = checkpoint_id
+
+        # Mark checkpoint in context packer
+        if self._context_packer:
+            self._context_packer.mark_checkpoint()
+
         return checkpoint_id
 
     def _estimate_pack_tokens(self) -> int:
@@ -813,13 +964,21 @@ class OrchestrationEngine:
 
         if success:
             parts.append("Task completed successfully.")
+        elif error:
+            parts.append(f"Task failed: {error}")
         else:
-            parts.append(f"Task failed: {error or 'Unknown error'}")
+            # Check what limit was hit
+            if self._turn_count >= self.config.max_turns:
+                parts.append("Task ended: turn limit reached.")
+            elif self._total_tokens >= self.config.max_total_tokens:
+                parts.append("Task ended: token limit reached.")
+            else:
+                parts.append("Task completed.")
 
         if self._files_modified:
             parts.append(f"Files modified: {', '.join(sorted(self._files_modified))}")
 
-        parts.append(f"Turns: {self._turn_count}, Tokens: {self._total_tokens}")
+        parts.append(f"Turns: {self._turn_count}, Tokens: {self._total_tokens:,}")
 
         return " ".join(parts)
 
@@ -842,3 +1001,94 @@ class OrchestrationEngine:
         )
         self._pinned_facts = []
         self._file_slices = []
+
+    async def agent_llm_callback(
+        self,
+        system_prompt: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        model_tier: str,
+    ) -> dict[str, Any]:
+        """LLM callback for agent execution.
+
+        This method provides a simple interface for agents to make LLM requests
+        through the existing WebSocket connection.
+
+        Args:
+            system_prompt: The agent's system prompt
+            messages: Conversation messages
+            tools: Tool definitions for the agent
+            model_tier: Model tier (fast, standard, advanced)
+
+        Returns:
+            Dict with 'content' and optional 'tool_calls'
+        """
+        # Reset response state
+        self._response_event.clear()
+        self._response_content = ""
+        self._response_tool_calls = []
+        self._response_error = None
+
+        # Generate request ID
+        request_id = generate_request_id()
+        self._active_request_id = request_id
+
+        # Build delta from messages (agent provides full message history)
+        delta = {
+            "messages": messages,
+            "tool_results_compressed": [],
+            "token_count": 0,
+        }
+
+        # Build minimal context pack with system prompt
+        context_pack = {
+            "rolling_summary": {},
+            "pinned_facts": [],
+            "file_slices": [],
+            "system_prompt": system_prompt,
+            "token_count": 0,
+        }
+
+        # Send request via WebSocket client
+        await self._ws.send_llm_request(
+            request_id=request_id,
+            context_ref=None,  # Agents don't use checkpoints
+            delta=delta,
+            context_pack=context_pack,
+            tools=tools,
+            model_tier=model_tier,
+            max_tokens=8192,
+            temperature=0.7,
+        )
+
+        # Wait for response
+        try:
+            await asyncio.wait_for(
+                self._response_event.wait(),
+                timeout=self.config.llm_timeout_ms / 1000,
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError("Agent LLM request timed out")
+
+        self._active_request_id = None
+
+        if self._response_error:
+            raise RuntimeError(f"Agent LLM error: {self._response_error}")
+
+        # Return response in format expected by AgentRunner
+        result: dict[str, Any] = {"content": self._response_content}
+
+        if self._response_tool_calls:
+            result["tool_calls"] = [
+                {
+                    "id": tc.tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.tool_name,
+                        "arguments": tc.args if isinstance(tc.args, str) else json.dumps(tc.args),
+                    },
+                }
+                for tc in self._response_tool_calls
+            ]
+
+        return result

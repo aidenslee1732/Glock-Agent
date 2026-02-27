@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+import os
 import secrets
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -16,14 +19,102 @@ from ...storage.postgres import PostgresClient
 from ...storage.redis import RedisClient
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+logger = logging.getLogger(__name__)
 
 
-# Configuration
-JWT_SECRET = "your-jwt-secret-replace-in-production"  # Load from env
+# Configuration - load from environment
+JWT_SECRET = os.environ.get("JWT_SECRET", "dev-mode-secret-key-at-least-32-chars")
 JWT_ALGORITHM = "HS256"
-JWT_ISSUER = "glock.dev"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
-REFRESH_TOKEN_EXPIRE_DAYS = 30
+JWT_ISSUER = os.environ.get("JWT_ISSUER", "glock.dev")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.environ.get("REFRESH_TOKEN_EXPIRE_DAYS", "30"))
+
+
+@dataclass
+class TokenPayload:
+    """Decoded JWT token payload."""
+    user_id: str
+    email: str
+    plan_tier: str
+    token_type: str = "access"
+
+
+class AuthError(Exception):
+    """Authentication error with message."""
+    def __init__(self, message: str, code: str = "auth_error"):
+        self.message = message
+        self.code = code
+        super().__init__(message)
+
+
+def verify_token(token: str, require_type: str = "access") -> TokenPayload:
+    """
+    Verify a JWT token and return the payload.
+
+    This is the core verification function used by both HTTP and WebSocket.
+
+    Args:
+        token: The JWT token string
+        require_type: Expected token type ("access" or "refresh")
+
+    Returns:
+        TokenPayload with user information
+
+    Raises:
+        AuthError: If token is invalid, expired, or wrong type
+    """
+    try:
+        payload = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=[JWT_ALGORITHM],
+            issuer=JWT_ISSUER
+        )
+
+        user_id = payload.get("sub")
+        if not user_id:
+            raise AuthError("Invalid token: missing user ID", "invalid_token")
+
+        token_type = payload.get("type", "access")
+        if token_type != require_type:
+            raise AuthError(f"Invalid token type: expected {require_type}", "invalid_token_type")
+
+        return TokenPayload(
+            user_id=user_id,
+            email=payload.get("email", ""),
+            plan_tier=payload.get("plan_tier", "free"),
+            token_type=token_type,
+        )
+
+    except jwt.ExpiredSignatureError:
+        raise AuthError("Token has expired", "token_expired")
+    except jwt.InvalidIssuerError:
+        raise AuthError("Invalid token issuer", "invalid_issuer")
+    except jwt.InvalidTokenError as e:
+        raise AuthError(f"Invalid token: {e}", "invalid_token")
+
+
+def verify_websocket_token(token: Optional[str]) -> TokenPayload:
+    """
+    Verify a token for WebSocket connections.
+
+    Args:
+        token: JWT token from query params or first message
+
+    Returns:
+        TokenPayload with user information
+
+    Raises:
+        AuthError: If token is missing or invalid
+    """
+    if not token:
+        raise AuthError("Missing authentication token", "missing_token")
+
+    # Remove "Bearer " prefix if present
+    if token.startswith("Bearer "):
+        token = token[7:]
+
+    return verify_token(token, require_type="access")
 
 
 # Request/Response Models
@@ -98,9 +189,16 @@ async def get_current_user(
             detail="Token has expired"
         )
     except jwt.InvalidTokenError as e:
+        # In production, don't expose internal error details
+        import os
+        DEV_MODE = os.environ.get("DEV_MODE", "").lower() in ("1", "true", "yes")
+        if DEV_MODE:
+            detail = f"Invalid token: {e}"
+        else:
+            detail = "We are experiencing some issues; please bear with us"
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid token: {e}"
+            detail=detail
         )
 
 

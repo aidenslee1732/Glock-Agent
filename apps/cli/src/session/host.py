@@ -40,6 +40,17 @@ from apps.cli.src.orchestrator.engine import (
 from apps.cli.src.context.packer import ContextPacker, PackerConfig
 from apps.cli.src.crypto.session_keys import SessionKeyManager
 
+# New subsystem imports
+from apps.cli.src.tasks.manager import TaskManager
+from apps.cli.src.tasks.background import BackgroundTaskRunner
+from apps.cli.src.agents.registry import AgentRegistry
+from apps.cli.src.agents.runner import AgentRunner
+from apps.cli.src.skills.registry import SkillRegistry
+from apps.cli.src.planning.mode import PlanMode
+from apps.cli.src.hooks.manager import HookManager
+from apps.cli.src.mcp.tools import MCPToolProxy
+from apps.cli.src.mcp.discovery import MCPServerDiscovery
+
 logger = logging.getLogger(__name__)
 
 
@@ -146,6 +157,61 @@ class SessionHost:
         self._setup_handlers()
         self._setup_model_b_handlers()
 
+        # New subsystem initialization
+        # Task management
+        self._task_manager = TaskManager(
+            db_path=Path.home() / ".glock" / "tasks.db"
+        )
+        self._background_runner = BackgroundTaskRunner(
+            task_manager=self._task_manager,
+            output_dir=Path.home() / ".glock" / "task_outputs",
+        )
+
+        # Agent system
+        self._agent_registry = AgentRegistry(
+            prompts_dir=Path(__file__).parent.parent / "agents" / "prompts",
+        )
+        self._agent_runner: Optional[AgentRunner] = None  # Initialized after connect
+
+        # Skills - load built-in and custom skills
+        self._skill_registry = SkillRegistry()
+        from ..skills.loader import SkillLoader
+        skill_loader = SkillLoader(self._skill_registry)
+        skill_loader.load_builtin_skills()
+        # Load custom skills from ~/.glock/skills/
+        custom_skills_dir = Path.home() / ".glock" / "skills"
+        if custom_skills_dir.exists():
+            skill_loader.load_custom_skills(custom_skills_dir)
+
+        # Plan mode
+        from ..planning.files import PlanFileManager
+        plan_file_manager = PlanFileManager(
+            plans_dir=str(Path.home() / ".glock" / "plans"),
+        )
+        self._plan_mode = PlanMode(file_manager=plan_file_manager)
+
+        # Hooks
+        from ..hooks.config import HookConfig
+        from ..hooks.executor import HookExecutor
+        hook_config = HookConfig(
+            config_path=str(Path.home() / ".glock" / "hooks.json"),
+        )
+        hook_executor = HookExecutor(workspace_dir=self.config.workspace_dir)
+        self._hook_manager = HookManager(
+            config=hook_config,
+            executor=hook_executor,
+            workspace_dir=self.config.workspace_dir,
+        )
+
+        # Wire hook manager to plan mode for plan-approved/rejected hooks
+        self._plan_mode.set_hook_manager(self._hook_manager)
+
+        # MCP integration
+        self._mcp_discovery = MCPServerDiscovery(
+            config_path=Path.home() / ".glock" / "mcp.json",
+        )
+        self._mcp_proxy: Optional[MCPToolProxy] = None  # Initialized after MCP servers discovered
+
     @property
     def session_id(self) -> Optional[str]:
         """Get session ID."""
@@ -160,6 +226,46 @@ class SessionHost:
     def is_connected(self) -> bool:
         """Check if connected."""
         return self.state in (SessionState.CONNECTED, SessionState.TASK_RUNNING)
+
+    @property
+    def task_manager(self) -> TaskManager:
+        """Get task manager."""
+        return self._task_manager
+
+    @property
+    def background_runner(self) -> BackgroundTaskRunner:
+        """Get background task runner."""
+        return self._background_runner
+
+    @property
+    def agent_registry(self) -> AgentRegistry:
+        """Get agent registry."""
+        return self._agent_registry
+
+    @property
+    def agent_runner(self) -> Optional[AgentRunner]:
+        """Get agent runner (available after connect)."""
+        return self._agent_runner
+
+    @property
+    def skill_registry(self) -> SkillRegistry:
+        """Get skill registry."""
+        return self._skill_registry
+
+    @property
+    def plan_mode(self) -> PlanMode:
+        """Get plan mode manager."""
+        return self._plan_mode
+
+    @property
+    def hook_manager(self) -> HookManager:
+        """Get hook manager."""
+        return self._hook_manager
+
+    @property
+    def mcp_proxy(self) -> Optional[MCPToolProxy]:
+        """Get MCP tool proxy (available after connect if MCP servers configured)."""
+        return self._mcp_proxy
 
     def on_delta(self, callback: Callable[[str, str], None]) -> None:
         """Register callback for task deltas.
@@ -224,8 +330,38 @@ class SessionHost:
         if self.config.auth_token:
             self._key_manager = SessionKeyManager(
                 master_token=self.config.auth_token,
-                session_id=self._session_id,
             )
+
+        # Initialize MCP proxy with discovered servers (with timeout)
+        try:
+            mcp_servers = await asyncio.wait_for(
+                self._mcp_discovery.discover_servers(),
+                timeout=30.0,  # 30 second timeout for MCP discovery
+            )
+            if mcp_servers:
+                self._mcp_proxy = MCPToolProxy(servers=mcp_servers)
+                await asyncio.wait_for(
+                    self._mcp_proxy.connect_all(),
+                    timeout=60.0,  # 60 second timeout for MCP connections
+                )
+        except asyncio.TimeoutError as e:
+            logger.error(f"MCP initialization timed out: {e}")
+            raise RuntimeError(
+                "MCP server initialization timed out. Check MCP server configuration."
+            ) from e
+        except Exception as e:
+            logger.error(f"MCP initialization failed: {e}")
+            raise RuntimeError(f"Failed to initialize MCP servers: {e}") from e
+
+        # Update tool broker with new subsystems
+        self._tools.set_task_manager(self._task_manager)
+        self._tools.set_background_runner(self._background_runner)
+        self._tools.set_agent_registry(self._agent_registry)
+        self._tools.set_skill_registry(self._skill_registry)
+        self._tools.set_plan_mode(self._plan_mode)
+        self._tools.set_hook_manager(self._hook_manager)
+        if self._mcp_proxy:
+            self._tools.set_mcp_proxy(self._mcp_proxy)
 
         # Model B: Initialize orchestration engine
         self._orchestrator = OrchestrationEngine(
@@ -240,7 +376,22 @@ class SessionHost:
             ),
         )
 
+        # Initialize agent runner (needs orchestrator for recursive agent spawning)
+        self._agent_runner = AgentRunner(
+            registry=self._agent_registry,
+            tool_broker=self._tools,
+            llm_callback=self._orchestrator.agent_llm_callback,  # Use orchestrator's LLM callback
+            session_store=None,  # Uses default
+            background_runner=self._background_runner,
+        )
+        self._tools.set_agent_runner(self._agent_runner)
+
         self.state = SessionState.CONNECTED
+
+        # Trigger session-start hooks
+        if self._hook_manager:
+            await self._hook_manager.on_session_start(self._session_id)
+
         return self._session_id
 
     async def resume(self, session_id: str, context_ref: Optional[str] = None) -> None:
@@ -268,8 +419,38 @@ class SessionHost:
         if self.config.auth_token:
             self._key_manager = SessionKeyManager(
                 master_token=self.config.auth_token,
-                session_id=session_id,
             )
+
+        # Initialize MCP proxy with discovered servers (with timeout)
+        try:
+            mcp_servers = await asyncio.wait_for(
+                self._mcp_discovery.discover_servers(),
+                timeout=30.0,  # 30 second timeout for MCP discovery
+            )
+            if mcp_servers:
+                self._mcp_proxy = MCPToolProxy(servers=mcp_servers)
+                await asyncio.wait_for(
+                    self._mcp_proxy.connect_all(),
+                    timeout=60.0,  # 60 second timeout for MCP connections
+                )
+        except asyncio.TimeoutError as e:
+            logger.error(f"MCP initialization timed out during resume: {e}")
+            raise RuntimeError(
+                "MCP server initialization timed out. Check MCP server configuration."
+            ) from e
+        except Exception as e:
+            logger.error(f"MCP initialization failed during resume: {e}")
+            raise RuntimeError(f"Failed to initialize MCP servers: {e}") from e
+
+        # Update tool broker with new subsystems
+        self._tools.set_task_manager(self._task_manager)
+        self._tools.set_background_runner(self._background_runner)
+        self._tools.set_agent_registry(self._agent_registry)
+        self._tools.set_skill_registry(self._skill_registry)
+        self._tools.set_plan_mode(self._plan_mode)
+        self._tools.set_hook_manager(self._hook_manager)
+        if self._mcp_proxy:
+            self._tools.set_mcp_proxy(self._mcp_proxy)
 
         # Initialize orchestration engine
         self._orchestrator = OrchestrationEngine(
@@ -284,7 +465,21 @@ class SessionHost:
             ),
         )
 
+        # Initialize agent runner
+        self._agent_runner = AgentRunner(
+            registry=self._agent_registry,
+            tool_broker=self._tools,
+            llm_callback=self._orchestrator.agent_llm_callback,  # Use orchestrator's LLM callback
+            session_store=None,  # Uses default
+            background_runner=self._background_runner,
+        )
+        self._tools.set_agent_runner(self._agent_runner)
+
         self.state = SessionState.CONNECTED
+
+        # Trigger session-start hooks
+        if self._hook_manager:
+            await self._hook_manager.on_session_start(self._session_id)
 
     def _compute_state_hash(self) -> str:
         """Compute hash of local state for resume verification."""
@@ -300,9 +495,51 @@ class SessionHost:
         return hashlib.sha256(state_json.encode()).hexdigest()[:16]
 
     async def disconnect(self) -> None:
-        """Disconnect from gateway."""
-        await self._ws.disconnect()
+        """Disconnect from gateway.
+
+        Ensures all resources are cleaned up even if individual cleanup steps fail.
+        Errors are collected and re-raised after all cleanup attempts.
+        """
+        errors: list[Exception] = []
+
+        # Trigger session-end hooks before disconnecting
+        if self._hook_manager and self._session_id:
+            try:
+                await self._hook_manager.on_session_end(self._session_id)
+            except Exception as e:
+                logger.error(f"Error in session-end hooks: {e}")
+                errors.append(e)
+
+        # Clean up MCP connections
+        if self._mcp_proxy:
+            try:
+                await self._mcp_proxy.disconnect_all()
+            except Exception as e:
+                logger.error(f"Error disconnecting MCP proxy: {e}")
+                errors.append(e)
+
+        # Stop any background tasks
+        try:
+            await self._background_runner.stop_all()
+        except Exception as e:
+            logger.error(f"Error stopping background tasks: {e}")
+            errors.append(e)
+
+        # Always attempt to disconnect WebSocket
+        try:
+            await self._ws.disconnect()
+        except Exception as e:
+            logger.error(f"Error disconnecting WebSocket: {e}")
+            errors.append(e)
+
         self.state = SessionState.DISCONNECTED
+
+        # If there were errors, raise an aggregate exception
+        if errors:
+            error_messages = [str(e) for e in errors]
+            raise RuntimeError(
+                f"Disconnect completed with {len(errors)} error(s): {'; '.join(error_messages)}"
+            )
 
     async def submit_task(self, prompt: str) -> str:
         """Submit a new task.
@@ -599,13 +836,11 @@ class SessionHost:
         """Set up Model B specific handlers."""
 
         # LLM Delta handler - streaming text
+        # NOTE: We do NOT call self._on_delta() here because the event-based path
+        # in TUI._submit_task() already handles display via run_task() events.
+        # Calling _on_delta here would cause duplicate output.
         def handle_llm_delta(payload: LLMDeltaPayload):
-            if payload.delta_type == "text" and self._on_delta:
-                self._on_delta("text", payload.content)
-            elif payload.delta_type == "thinking" and self._on_delta:
-                self._on_delta("thinking", payload.content)
-
-            # Update token count
+            # Update token count only - display is handled by event loop
             if self._current_task:
                 self._current_task.output_tokens += payload.token_count
 
@@ -639,10 +874,10 @@ class SessionHost:
 
         # Checkpoint ACK handler
         def handle_checkpoint_ack(payload: ContextCheckpointAckPayload):
-            if payload.stored:
-                logger.debug(f"Checkpoint stored: {payload.checkpoint_id}")
+            if payload.stored_at:
+                logger.debug(f"Checkpoint stored: {payload.checkpoint_id} at {payload.stored_at}")
             else:
-                logger.warning(f"Checkpoint failed: {payload.checkpoint_id}")
+                logger.warning(f"Checkpoint not stored: {payload.checkpoint_id}")
 
         self._ws.on_checkpoint_ack(handle_checkpoint_ack)
 

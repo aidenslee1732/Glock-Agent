@@ -1,192 +1,251 @@
-# Deployment Guide
+# Glock Deployment Guide
 
-This guide covers deploying Glock to production environments.
+Complete guide for deploying, configuring, and maintaining Glock in production.
 
 ## Table of Contents
 
 - [Architecture Overview](#architecture-overview)
 - [Prerequisites](#prerequisites)
-- [Railway Deployment](#railway-deployment)
-- [Manual Deployment](#manual-deployment)
-- [Supabase Setup](#supabase-setup)
-- [Environment Variables](#environment-variables)
-- [Scaling](#scaling)
-- [Monitoring](#monitoring)
+- [Environment Variables & Keys](#environment-variables--keys)
+- [Deployment Options](#deployment-options)
+  - [Option 1: Docker Compose (Recommended for Small Teams)](#option-1-docker-compose)
+  - [Option 2: Railway (Managed Platform)](#option-2-railway)
+  - [Option 3: Manual Deployment (AWS/GCP/Self-hosted)](#option-3-manual-deployment)
+- [Database Setup](#database-setup)
+- [Post-Deployment Verification](#post-deployment-verification)
+- [Maintenance Guide](#maintenance-guide)
+- [Monitoring & Alerting](#monitoring--alerting)
 - [Security Hardening](#security-hardening)
+- [Backup & Recovery](#backup--recovery)
+- [Troubleshooting](#troubleshooting)
+
+---
 
 ## Architecture Overview
 
-Production deployment consists of:
+Glock uses a **client-orchestrated architecture** (Model B):
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         RAILWAY                                      │
-│                                                                      │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
-│  │   Gateway    │  │   Gateway    │  │   Runtime    │              │
-│  │   Service    │  │   Service    │  │    Host      │              │
-│  │   (2 replicas)│  │             │  │              │              │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘              │
-│         │                 │                 │                       │
-│         └────────┬────────┴────────┬────────┘                       │
-│                  │                 │                                │
-│         ┌────────▼────────┐ ┌──────▼───────┐                       │
-│         │     Redis       │ │   Healer     │                       │
-│         │   (Railway)     │ │   Worker     │                       │
-│         └─────────────────┘ └──────────────┘                       │
-└─────────────────────────────────────────────────────────────────────┘
-                                    │
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         USER'S MACHINE                                   │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  Glock CLI                                                         │  │
+│  │   ├─ OrchestrationEngine (runs the full agent loop)               │  │
+│  │   ├─ ToolBroker (executes tools locally: read/edit/bash/git)      │  │
+│  │   ├─ ContextPacker (40-60% token reduction)                       │  │
+│  │   └─ SessionKeyManager (per-session encryption)                   │  │
+│  └────────────────────────────────┬──────────────────────────────────┘  │
+└───────────────────────────────────┼─────────────────────────────────────┘
+                                    │ WebSocket (JWT authenticated)
                                     ▼
-                         ┌─────────────────────┐
-                         │      Supabase       │
-                         │    (PostgreSQL)     │
-                         └─────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         CONTROL PLANE (Your Server)                      │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  Gateway Service (stateless, horizontally scalable)              │    │
+│  │   ├─ JWT Authentication                                          │    │
+│  │   ├─ LLM Proxy (Anthropic Claude, OpenAI, Google)                │    │
+│  │   ├─ Checkpoint Storage (encrypted context snapshots)            │    │
+│  │   ├─ Rate Limiting & Metering                                    │    │
+│  │   └─ Session Management                                          │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│            │                          │                                  │
+│            ▼                          ▼                                  │
+│        Redis                     PostgreSQL                              │
+│   (sessions, routing,       (users, checkpoints,                        │
+│    rate limiting)            usage, audit logs)                         │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
+
+**Key Benefits:**
+- Server is stateless → easy horizontal scaling
+- No per-session server processes → cost efficient
+- Tools run locally → secure, no code exposure to server
+- Checkpoints → session pause/resume support
+
+---
 
 ## Prerequisites
 
-- [Railway CLI](https://docs.railway.app/develop/cli) installed
-- [Supabase](https://supabase.com) account
-- Domain for SSL (e.g., `api.glock.dev`)
-- Ed25519 key pair for plan signing
+Before deployment, ensure you have:
 
-### Generate Signing Keys
+1. **Domain** (optional but recommended)
+   - For production: `api.yourdomain.com`
+   - SSL certificate (auto-provisioned on Railway/most platforms)
 
+2. **LLM API Keys** (at least one required)
+   - [Anthropic API Key](https://console.anthropic.com/) - Recommended
+   - [OpenAI API Key](https://platform.openai.com/) - Optional
+   - [Google AI API Key](https://makersuite.google.com/) - Optional
+
+3. **Infrastructure Requirements**
+   - PostgreSQL 15+ (or Supabase)
+   - Redis 7+
+   - Docker (for containerized deployment)
+
+---
+
+## Environment Variables & Keys
+
+### Complete Reference
+
+| Variable | Required | Description | How to Generate |
+|----------|----------|-------------|-----------------|
+| `DATABASE_URL` | Yes | PostgreSQL connection string | From your database provider |
+| `REDIS_URL` | Yes | Redis connection string | From your Redis provider |
+| `JWT_SECRET` | Yes | Secret for signing JWT tokens (32+ chars) | `openssl rand -hex 32` |
+| `JWT_ISSUER` | No | JWT issuer claim | Default: `glock.dev` |
+| `CONTEXT_MASTER_KEY` | Yes | Master key for context encryption (64 hex chars) | `openssl rand -hex 32` |
+| `ANTHROPIC_API_KEY` | Yes* | Anthropic Claude API key | From Anthropic Console |
+| `OPENAI_API_KEY` | No | OpenAI API key | From OpenAI Platform |
+| `GOOGLE_API_KEY` | No | Google AI API key | From Google AI Studio |
+| `LOG_LEVEL` | No | Logging level | `debug`, `info`, `warn`, `error` |
+| `PLAN_SIGNING_PRIVATE_KEY` | No | Ed25519 key for plan signing | See below |
+
+*At least one LLM provider API key is required.
+
+### Generating Required Keys
+
+#### 1. JWT Secret (Required)
+```bash
+# Generate a secure 32-byte hex string
+openssl rand -hex 32
+
+# Example output: a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6
+```
+
+#### 2. Context Master Key (Required)
+```bash
+# Generate a 32-byte (64 hex char) encryption key
+openssl rand -hex 32
+
+# Example output: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+```
+
+#### 3. Plan Signing Keys (Optional - for signed execution plans)
 ```bash
 # Generate Ed25519 key pair
-python -c "
+python3 -c "
 from nacl.signing import SigningKey
 from nacl.encoding import Base64Encoder
 
 key = SigningKey.generate()
-print('Private key:', key.encode(encoder=Base64Encoder).decode())
-print('Public key:', key.verify_key.encode(encoder=Base64Encoder).decode())
+print('PLAN_SIGNING_PRIVATE_KEY=' + key.encode(encoder=Base64Encoder).decode())
+print('PLAN_SIGNING_PUBLIC_KEY=' + key.verify_key.encode(encoder=Base64Encoder).decode())
 "
 ```
 
-Save the private key securely - you'll need it for `PLAN_SIGNING_PRIVATE_KEY`.
-
-## Railway Deployment
-
-### 1. Create Railway Project
+### Sample .env File
 
 ```bash
-# Login to Railway
-railway login
+# =============================================================================
+# DATABASE (Required)
+# =============================================================================
+DATABASE_URL=postgresql://glock:your_password@localhost:5432/glock
 
-# Create new project
-railway init
+# =============================================================================
+# REDIS (Required)
+# =============================================================================
+REDIS_URL=redis://localhost:6379
 
-# Link to existing repo
-railway link
+# =============================================================================
+# AUTHENTICATION (Required)
+# =============================================================================
+JWT_SECRET=your-generated-32-char-secret-here
+JWT_ISSUER=glock.dev
+
+# Access token expiry (minutes)
+ACCESS_TOKEN_EXPIRE_MINUTES=60
+
+# Refresh token expiry (days)
+REFRESH_TOKEN_EXPIRE_DAYS=30
+
+# =============================================================================
+# ENCRYPTION (Required)
+# =============================================================================
+CONTEXT_MASTER_KEY=your-64-character-hex-key-here
+
+# =============================================================================
+# LLM PROVIDERS (At least one required)
+# =============================================================================
+ANTHROPIC_API_KEY=sk-ant-api03-...
+# OPENAI_API_KEY=sk-...
+# GOOGLE_API_KEY=...
+
+# =============================================================================
+# OPTIONAL SETTINGS
+# =============================================================================
+LOG_LEVEL=info
+
+# Rate limiting
+RATE_LIMIT_REQUESTS_PER_MINUTE=60
+RATE_LIMIT_CONCURRENT_SESSIONS=10
+
+# Session timeouts
+WS_HEARTBEAT_INTERVAL_MS=30000
+SESSION_IDLE_TIMEOUT_MS=3600000
 ```
 
-### 2. Configure Services
+---
 
-Create `railway.toml` in project root:
+## Deployment Options
 
-```toml
-[build]
-builder = "dockerfile"
+### Option 1: Docker Compose
 
-[deploy]
-numReplicas = 2
-healthcheckPath = "/health"
-healthcheckTimeout = 10
-restartPolicyType = "ON_FAILURE"
-restartPolicyMaxRetries = 3
-```
+Best for: Small teams, self-hosted, development/staging environments.
 
-### 3. Add Services
+#### Step 1: Download and Configure
 
 ```bash
-# Gateway service
-railway add --service gateway-service
+# Download the latest release
+curl -LO https://releases.glock.dev/latest/glock-server.tar.gz
+tar -xzf glock-server.tar.gz
+cd glock-server
 
-# Runtime host
-railway add --service runtime-host
+# Or download from the releases page and extract manually
 
-# Healer worker
-railway add --service healer-worker
+# Copy and configure environment
+cp .env.example .env
 
-# Metering worker
-railway add --service metering-worker
-
-# Redis
-railway add --database redis
-
-# Or link external Postgres
-railway variables set DATABASE_URL="postgresql://..."
+# Edit .env with your values
+nano .env
 ```
 
-### 4. Set Environment Variables
+#### Step 2: Generate Required Keys
 
 ```bash
-# Gateway service
-railway variables set -s gateway-service \
-  DATABASE_URL='${{Postgres.DATABASE_URL}}' \
-  REDIS_URL='${{Redis.REDIS_URL}}' \
-  JWT_SECRET='your-32-char-secret-here' \
-  JWT_ISSUER='glock.dev' \
-  PLANNER_SERVICE_URL='http://planner-service.railway.internal:8000' \
-  HEALER_WORKER_URL='http://healer-worker.railway.internal:8000' \
-  RUNTIME_HOST_URL='http://runtime-host.railway.internal:9000' \
-  PLAN_SIGNING_PRIVATE_KEY='base64-encoded-private-key' \
-  ANTHROPIC_API_KEY='sk-ant-...' \
-  LOG_LEVEL='info'
+# Generate JWT_SECRET
+echo "JWT_SECRET=$(openssl rand -hex 32)" >> .env
 
-# Runtime host
-railway variables set -s runtime-host \
-  REDIS_URL='${{Redis.REDIS_URL}}' \
-  GATEWAY_URL='ws://gateway-service.railway.internal:8000' \
-  POOL_INITIAL_SIZE='5' \
-  POOL_TARGET_SIZE='20' \
-  POOL_MAX_SIZE='50' \
-  LOG_LEVEL='info'
-
-# Healer worker
-railway variables set -s healer-worker \
-  DATABASE_URL='${{Postgres.DATABASE_URL}}' \
-  REDIS_URL='${{Redis.REDIS_URL}}' \
-  HEALER_MAX_RETRIES='3' \
-  LOG_LEVEL='info'
-
-# Metering worker
-railway variables set -s metering-worker \
-  DATABASE_URL='${{Postgres.DATABASE_URL}}' \
-  REDIS_URL='${{Redis.REDIS_URL}}' \
-  METERING_BATCH_SIZE='100' \
-  LOG_LEVEL='info'
+# Generate CONTEXT_MASTER_KEY
+echo "CONTEXT_MASTER_KEY=$(openssl rand -hex 32)" >> .env
 ```
 
-### 5. Deploy
+#### Step 3: Start Services
 
 ```bash
-# Deploy all services
-railway up
+# Build and start all services
+docker-compose up -d --build
 
-# Check deployment status
-railway status
+# Check status
+docker-compose ps
 
 # View logs
-railway logs -s gateway-service
+docker-compose logs -f gateway
 ```
 
-### 6. Configure Domain
+#### Step 4: Verify Deployment
 
 ```bash
-# Add custom domain
-railway domain add api.glock.dev -s gateway-service
+# Health check
+curl http://localhost:8000/health
+# Expected: {"status": "healthy", "gateway_id": "gw_xxx", "dev_mode": false}
 
-# Verify SSL
-curl https://api.glock.dev/health
+# Readiness check
+curl http://localhost:8000/ready
+# Expected: {"status": "ready", "gateway_id": "gw_xxx"}
 ```
 
-## Manual Deployment
-
-For non-Railway deployments (AWS, GCP, self-hosted).
-
-### Docker Compose Production
+#### Docker Compose for Production
 
 Create `docker-compose.prod.yml`:
 
@@ -204,8 +263,8 @@ services:
       - DATABASE_URL=${DATABASE_URL}
       - REDIS_URL=redis://redis:6379
       - JWT_SECRET=${JWT_SECRET}
-      - JWT_ISSUER=${JWT_ISSUER}
-      - PLAN_SIGNING_PRIVATE_KEY=${PLAN_SIGNING_PRIVATE_KEY}
+      - JWT_ISSUER=${JWT_ISSUER:-glock.dev}
+      - CONTEXT_MASTER_KEY=${CONTEXT_MASTER_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - LOG_LEVEL=info
     depends_on:
@@ -221,49 +280,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-
-  runtime-host:
-    build:
-      context: .
-      dockerfile: infra/docker/runtime-host.Dockerfile
-    environment:
-      - REDIS_URL=redis://redis:6379
-      - GATEWAY_URL=ws://gateway:8000
-      - POOL_INITIAL_SIZE=5
-      - POOL_TARGET_SIZE=20
-      - POOL_MAX_SIZE=50
-    depends_on:
-      - redis
-      - gateway
-    deploy:
-      resources:
-        limits:
-          cpus: '2'
-          memory: 4G
-
-  healer-worker:
-    build:
-      context: .
-      dockerfile: infra/docker/gateway.Dockerfile
-    command: python -m apps.server.src.healer.main
-    environment:
-      - DATABASE_URL=${DATABASE_URL}
-      - REDIS_URL=redis://redis:6379
-      - HEALER_MAX_RETRIES=3
-    depends_on:
-      - redis
-
-  metering-worker:
-    build:
-      context: .
-      dockerfile: infra/docker/gateway.Dockerfile
-    command: python -m apps.server.src.metering.main
-    environment:
-      - DATABASE_URL=${DATABASE_URL}
-      - REDIS_URL=redis://redis:6379
-      - METERING_BATCH_SIZE=100
-    depends_on:
-      - redis
+    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
@@ -274,288 +291,614 @@ services:
       resources:
         limits:
           memory: 512M
+    restart: unless-stopped
 
 volumes:
   redis-data:
 ```
 
-Deploy:
-
 ```bash
-# Build and start
+# Deploy production
 docker-compose -f docker-compose.prod.yml up -d --build
 
 # Scale gateway
 docker-compose -f docker-compose.prod.yml up -d --scale gateway=3
 ```
 
-### Kubernetes Deployment
+---
 
-See `infra/k8s/` for Kubernetes manifests (Helm charts coming soon).
+### Option 2: Railway
 
-## Supabase Setup
+Best for: Quick deployment, auto-scaling, managed infrastructure.
 
-### 1. Create Project
-
-1. Go to [supabase.com](https://supabase.com)
-2. Create new project
-3. Note the connection string from Settings → Database
-
-### 2. Run Migrations
+#### Step 1: Install Railway CLI
 
 ```bash
-# Set connection string
+npm install -g @railway/cli
+railway login
+```
+
+#### Step 2: Create Project
+
+```bash
+# Initialize project
+railway init
+
+# Create from Docker image
+railway add --docker glock/glock-gateway:latest
+```
+
+#### Step 3: Add Services
+
+```bash
+# Add Redis
+railway add --database redis
+
+# Add PostgreSQL (or use external like Supabase)
+railway add --database postgres
+```
+
+#### Step 4: Configure Environment Variables
+
+```bash
+# Set all required variables
+railway variables set \
+  DATABASE_URL='${{Postgres.DATABASE_URL}}' \
+  REDIS_URL='${{Redis.REDIS_URL}}' \
+  JWT_SECRET='your-32-char-secret' \
+  JWT_ISSUER='glock.dev' \
+  CONTEXT_MASTER_KEY='your-64-char-hex-key' \
+  ANTHROPIC_API_KEY='sk-ant-...' \
+  LOG_LEVEL='info'
+```
+
+#### Step 5: Deploy
+
+```bash
+# Deploy
+railway up
+
+# Check status
+railway status
+
+# View logs
+railway logs
+```
+
+#### Step 6: Add Custom Domain
+
+```bash
+# Add your domain
+railway domain add api.yourdomain.com
+
+# Verify SSL
+curl https://api.yourdomain.com/health
+```
+
+---
+
+### Option 3: Manual Deployment
+
+Best for: AWS, GCP, Azure, or custom infrastructure.
+
+#### Kubernetes Deployment
+
+```yaml
+# gateway-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: glock-gateway
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: glock-gateway
+  template:
+    metadata:
+      labels:
+        app: glock-gateway
+    spec:
+      containers:
+      - name: gateway
+        image: your-registry/glock-gateway:latest
+        ports:
+        - containerPort: 8000
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: glock-secrets
+              key: database-url
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: glock-secrets
+              key: redis-url
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: glock-secrets
+              key: jwt-secret
+        - name: CONTEXT_MASTER_KEY
+          valueFrom:
+            secretKeyRef:
+              name: glock-secrets
+              key: context-master-key
+        - name: ANTHROPIC_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: glock-secrets
+              key: anthropic-api-key
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+```
+
+---
+
+## Database Setup
+
+### Using Supabase (Recommended)
+
+1. Create a project at [supabase.com](https://supabase.com)
+2. Get the connection string from Settings → Database
+3. Run migrations:
+
+```bash
 export DATABASE_URL="postgresql://postgres:[PASSWORD]@[HOST]:5432/postgres"
 
-# Run migrations in order
-psql $DATABASE_URL -f infra/supabase/migrations/0001_init.sql
-psql $DATABASE_URL -f infra/supabase/migrations/0002_sessions_tasks.sql
-psql $DATABASE_URL -f infra/supabase/migrations/0003_plans.sql
-psql $DATABASE_URL -f infra/supabase/migrations/0004_usage_audit.sql
-psql $DATABASE_URL -f infra/supabase/migrations/0005_preferences.sql
+# Run all migrations in order
+for f in infra/supabase/migrations/*.sql; do
+  echo "Running $f..."
+  psql "$DATABASE_URL" -f "$f"
+done
 ```
 
-### 3. Configure Row Level Security (Optional)
-
-For multi-tenant deployments:
-
-```sql
--- Enable RLS
-ALTER TABLE sessions ENABLE ROW LEVEL SECURITY;
-ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
-
--- Create policies
-CREATE POLICY "Users can only see their sessions"
-ON sessions FOR ALL
-USING (user_id = auth.uid());
-
-CREATE POLICY "Users can only see their tasks"
-ON tasks FOR ALL
-USING (user_id = auth.uid());
-```
-
-## Environment Variables
-
-### Complete Reference
-
-| Variable | Service | Required | Description |
-|----------|---------|----------|-------------|
-| `DATABASE_URL` | Gateway, Workers | Yes | PostgreSQL connection string |
-| `REDIS_URL` | All | Yes | Redis connection string |
-| `JWT_SECRET` | Gateway | Yes | JWT signing secret (32+ chars) |
-| `JWT_ISSUER` | Gateway | No | JWT issuer claim |
-| `PLAN_SIGNING_PRIVATE_KEY` | Gateway | Yes | Ed25519 private key (base64) |
-| `ANTHROPIC_API_KEY` | Gateway | Yes* | Anthropic API key |
-| `OPENAI_API_KEY` | Gateway | Yes* | OpenAI API key |
-| `LITELLM_API_BASE` | Gateway | No | LiteLLM proxy URL |
-| `LITELLM_MASTER_KEY` | Gateway | No | LiteLLM master key |
-| `LOG_LEVEL` | All | No | `debug`, `info`, `warn`, `error` |
-| `RATE_LIMIT_REQUESTS_PER_MINUTE` | Gateway | No | Default: 60 |
-| `RATE_LIMIT_CONCURRENT_SESSIONS` | Gateway | No | Default: 10 |
-| `WS_HEARTBEAT_INTERVAL_MS` | Gateway | No | Default: 30000 |
-| `SESSION_IDLE_TIMEOUT_MS` | Gateway | No | Default: 3600000 |
-| `POOL_INITIAL_SIZE` | Runtime Host | No | Default: 5 |
-| `POOL_TARGET_SIZE` | Runtime Host | No | Default: 20 |
-| `POOL_MAX_SIZE` | Runtime Host | No | Default: 50 |
-| `HEALER_MAX_RETRIES` | Healer | No | Default: 3 |
-| `METERING_BATCH_SIZE` | Metering | No | Default: 100 |
-
-*At least one LLM provider API key is required.
-
-## Scaling
-
-### Horizontal Scaling
-
-**Gateway Service:**
-- Stateless, scale freely
-- Use Railway's auto-scaling or K8s HPA
-- Recommended: 2-4 replicas minimum
-
-**Runtime Host:**
-- Stateful (manages runtime pool)
-- Scale by adding more hosts
-- Each host manages its own pool
-
-**Workers:**
-- Single replica per type usually sufficient
-- Scale based on queue depth
-
-### Vertical Scaling
-
-**Gateway:**
-- CPU: 0.5-1 vCPU per replica
-- Memory: 512MB-1GB per replica
-
-**Runtime Host:**
-- CPU: 1-2 vCPU (depends on pool size)
-- Memory: 2-4GB (50-100MB per runtime)
-
-**Redis:**
-- Memory: 256MB-1GB (depends on session count)
-
-### Auto-scaling Configuration (Railway)
-
-```toml
-[deploy]
-numReplicas = 2
-
-[deploy.autoscaling]
-enabled = true
-minReplicas = 2
-maxReplicas = 10
-targetCPUPercent = 70
-targetMemoryPercent = 80
-```
-
-## Monitoring
-
-### Health Endpoints
+### Using Self-hosted PostgreSQL
 
 ```bash
-# Gateway health
-GET /health
-# Returns: {"status": "healthy", "version": "1.0.0"}
+# Create database
+createdb glock
 
-# Gateway readiness
-GET /ready
-# Returns: {"ready": true, "redis": true, "postgres": true}
+# Set connection string
+export DATABASE_URL="postgresql://glock:password@localhost:5432/glock"
 
-# Gateway metrics
-GET /metrics
-# Returns: Prometheus-format metrics
+# Run migrations
+psql "$DATABASE_URL" -f infra/supabase/migrations/0001_init.sql
+psql "$DATABASE_URL" -f infra/supabase/migrations/0002_sessions_tasks.sql
+psql "$DATABASE_URL" -f infra/supabase/migrations/0003_plans.sql
+psql "$DATABASE_URL" -f infra/supabase/migrations/0004_usage_audit.sql
+psql "$DATABASE_URL" -f infra/supabase/migrations/0005_preferences.sql
+psql "$DATABASE_URL" -f infra/supabase/migrations/0006_context_checkpoints.sql
 ```
 
-### Recommended Metrics
+### Database Schema Overview
 
-1. **Request Rate** - Requests per second by endpoint
-2. **Latency** - p50, p95, p99 response times
-3. **Error Rate** - 4xx and 5xx responses
-4. **WebSocket Connections** - Active connections
-5. **Session Count** - Active sessions per gateway
-6. **Runtime Pool** - Warm/busy/draining counts
-7. **Queue Depth** - Healer and metering queues
+| Table | Purpose |
+|-------|---------|
+| `users` | User accounts and plan tiers |
+| `organizations` | Team/enterprise organizations |
+| `organization_memberships` | User-org relationships |
+| `sessions` | Active and historical sessions |
+| `tasks` | Task execution records |
+| `context_checkpoints` | Encrypted conversation snapshots |
+| `usage_events` | Token usage and metering |
+| `audit_logs` | Security and compliance logging |
 
-### Logging
+---
 
-JSON-structured logs for easy parsing:
+## Post-Deployment Verification
+
+### Health Check Endpoints
+
+```bash
+# Basic health
+curl https://api.yourdomain.com/health
+# Expected: {"status": "healthy", "gateway_id": "gw_xxx"}
+
+# Readiness (checks Redis + DB)
+curl https://api.yourdomain.com/ready
+# Expected: {"status": "ready", "gateway_id": "gw_xxx"}
+```
+
+### Verify WebSocket Connection
+
+```bash
+# Using websocat
+websocat "wss://api.yourdomain.com/ws/client?token=YOUR_JWT_TOKEN"
+```
+
+### Create Test User
+
+```sql
+-- In your database
+INSERT INTO users (email, name, plan_tier, status)
+VALUES ('test@example.com', 'Test User', 'pro', 'active');
+```
+
+---
+
+## Maintenance Guide
+
+### Routine Maintenance Tasks
+
+#### Daily
+- [ ] Check health endpoints
+- [ ] Review error logs for anomalies
+- [ ] Verify Redis memory usage
+
+#### Weekly
+- [ ] Clean up expired checkpoints
+- [ ] Review and archive old sessions
+- [ ] Check database connection pool health
+
+#### Monthly
+- [ ] Rotate JWT secrets (optional, requires user re-auth)
+- [ ] Review and update rate limits
+- [ ] Analyze usage patterns
+- [ ] Update dependencies
+
+### Cleanup Commands
+
+```bash
+# Clean expired checkpoints (run via cron)
+psql "$DATABASE_URL" -c "SELECT cleanup_expired_checkpoints();"
+
+# Clean old sessions (older than 30 days)
+psql "$DATABASE_URL" -c "
+  UPDATE sessions
+  SET status = 'archived'
+  WHERE status = 'ended'
+    AND updated_at < NOW() - INTERVAL '30 days';
+"
+
+# Redis cleanup (handled automatically with TTL, but can force)
+redis-cli KEYS "sess:*" | head -100  # Preview
+```
+
+### Log Rotation
+
+Logs are JSON-structured for easy parsing:
 
 ```json
 {
   "timestamp": "2024-01-15T10:30:00Z",
   "level": "info",
   "service": "gateway",
-  "request_id": "req_abc123",
   "session_id": "sess_xyz789",
-  "message": "Task completed",
-  "duration_ms": 1523
+  "message": "LLM request completed",
+  "tokens_used": 1523
 }
 ```
 
-### Alerting Recommendations
+Configure log rotation in your deployment:
 
-| Alert | Condition | Severity |
-|-------|-----------|----------|
-| High Error Rate | >5% 5xx in 5min | Critical |
-| High Latency | p99 >5s for 5min | Warning |
-| Low Warm Pool | <3 warm runtimes | Warning |
-| Redis Down | Health check failing | Critical |
-| DB Connection Pool | >90% utilized | Warning |
-| Memory Pressure | >85% memory used | Warning |
+```bash
+# Docker: logs are rotated by Docker daemon
+# Configure in daemon.json:
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m",
+    "max-file": "3"
+  }
+}
+```
+
+### Updating the Service
+
+```bash
+# Docker Compose - pull latest image and restart
+docker-compose pull
+docker-compose up -d
+
+# Railway - update to new image version
+railway service update --image glock/glock-gateway:v1.2.0
+
+# Kubernetes
+kubectl set image deployment/glock-gateway gateway=glock/glock-gateway:v1.2.0
+kubectl rollout status deployment/glock-gateway
+```
+
+### Rollback Procedure
+
+```bash
+# Docker
+docker-compose down
+docker tag glock-gateway:previous glock-gateway:latest
+docker-compose up -d
+
+# Railway
+railway rollback
+
+# Kubernetes
+kubectl rollout undo deployment/glock-gateway
+```
+
+---
+
+## Monitoring & Alerting
+
+### Key Metrics to Monitor
+
+| Metric | Warning | Critical | Description |
+|--------|---------|----------|-------------|
+| HTTP 5xx Rate | >1% | >5% | Server errors |
+| Response Latency p99 | >3s | >10s | Slow requests |
+| WebSocket Connections | >80% capacity | >95% | Connection saturation |
+| Redis Memory | >70% | >90% | Cache pressure |
+| Database Connections | >80% pool | >95% pool | Connection exhaustion |
+| LLM Error Rate | >5% | >20% | Provider issues |
+
+### Prometheus Metrics (if enabled)
+
+```bash
+# Scrape endpoint
+curl http://localhost:8000/metrics
+```
+
+### Recommended Alerts
+
+```yaml
+# Prometheus AlertManager rules
+groups:
+  - name: glock
+    rules:
+      - alert: HighErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+
+      - alert: HighLatency
+        expr: histogram_quantile(0.99, http_request_duration_seconds_bucket) > 5
+        for: 5m
+        labels:
+          severity: warning
+
+      - alert: RedisDown
+        expr: redis_up == 0
+        for: 1m
+        labels:
+          severity: critical
+```
+
+---
 
 ## Security Hardening
 
+### Checklist
+
+- [ ] **TLS Everywhere** - HTTPS/WSS for all external traffic
+- [ ] **Strong Secrets** - All keys are randomly generated, 32+ bytes
+- [ ] **Secret Rotation** - Plan for periodic key rotation
+- [ ] **Rate Limiting** - Enabled and tuned
+- [ ] **Authentication** - JWT tokens with short expiry
+- [ ] **Authorization** - Session ownership verification
+- [ ] **Audit Logging** - All security events logged
+- [ ] **Network Isolation** - Database/Redis not publicly accessible
+- [ ] **Dependency Updates** - Regular security patches
+
+### JWT Security
+
+```python
+# Token configuration (in auth.py)
+ACCESS_TOKEN_EXPIRE_MINUTES = 60      # Short-lived access tokens
+REFRESH_TOKEN_EXPIRE_DAYS = 30        # Longer refresh tokens
+JWT_ALGORITHM = "HS256"               # HMAC-SHA256
+```
+
+### Rate Limiting
+
+Default limits (configurable):
+- 60 requests per minute per user
+- 10 concurrent sessions per user
+- 100 LLM requests per minute per user
+
 ### Network Security
 
-1. **TLS Everywhere**
-   - Use HTTPS/WSS for all external traffic
-   - Internal services can use HTTP within VPC
-
-2. **IP Allowlisting**
-   - Restrict database access to service IPs
-   - Use Railway's private networking
-
-3. **Rate Limiting**
-   - Configure per-user limits
-   - Implement DDoS protection (Cloudflare)
-
-### Secret Management
-
 ```bash
-# Use Railway's built-in secret management
-railway variables set JWT_SECRET=$(openssl rand -hex 32) --secret
+# Ensure Redis is not publicly accessible
+redis-cli CONFIG GET bind
+# Should return: 127.0.0.1 or internal network only
 
-# Or use external secret manager
-# AWS Secrets Manager, HashiCorp Vault, etc.
+# Ensure PostgreSQL requires SSL in production
+# In DATABASE_URL: ?sslmode=require
 ```
 
-### Audit Logging
+---
 
-Enable audit logging for compliance:
-
-```sql
--- All actions logged to audit_logs table
--- Query recent security events:
-SELECT * FROM audit_logs
-WHERE severity IN ('warn', 'high', 'critical')
-ORDER BY created_at DESC
-LIMIT 100;
-```
-
-### Security Checklist
-
-- [ ] TLS certificates configured
-- [ ] JWT secret is random 32+ characters
-- [ ] Database credentials rotated
-- [ ] API keys stored securely (not in code)
-- [ ] Rate limiting enabled
-- [ ] Audit logging enabled
-- [ ] Plan signing keys generated and stored securely
-- [ ] No debug logging in production
-- [ ] Health endpoints don't leak sensitive info
-
-## Rollback Procedure
-
-### Railway
-
-```bash
-# List deployments
-railway deployments
-
-# Rollback to previous
-railway rollback
-```
-
-### Docker
-
-```bash
-# Tag releases
-docker tag glock-gateway:latest glock-gateway:v1.0.0
-
-# Rollback
-docker-compose -f docker-compose.prod.yml down
-docker tag glock-gateway:v0.9.0 glock-gateway:latest
-docker-compose -f docker-compose.prod.yml up -d
-```
-
-## Disaster Recovery
+## Backup & Recovery
 
 ### Backup Strategy
 
-1. **Database**: Supabase automatic backups + point-in-time recovery
-2. **Redis**: Enable AOF persistence
-3. **Secrets**: Store in external secret manager with backup
+| Component | Frequency | Retention | Method |
+|-----------|-----------|-----------|--------|
+| PostgreSQL | Daily | 30 days | pg_dump / Supabase automatic |
+| Redis | Hourly | 7 days | RDB snapshots |
+| Secrets | On change | Versioned | Secret manager |
 
-### Recovery Steps
+### PostgreSQL Backup
 
-1. Restore database from backup
-2. Deploy services
-3. Verify health endpoints
-4. Run smoke tests
-5. Enable traffic
+```bash
+# Manual backup
+pg_dump "$DATABASE_URL" > backup_$(date +%Y%m%d).sql
 
-## Support
+# Restore
+psql "$DATABASE_URL" < backup_20240115.sql
+```
 
-For deployment issues:
-- GitHub Issues: https://github.com/glock/glock/issues
-- Discord: https://discord.gg/glock
-- Email: support@glock.dev
+### Redis Backup
+
+```bash
+# Trigger RDB save
+redis-cli BGSAVE
+
+# Copy RDB file
+cp /var/lib/redis/dump.rdb /backups/redis_$(date +%Y%m%d).rdb
+```
+
+### Disaster Recovery Steps
+
+1. **Restore Database**
+   ```bash
+   psql "$DATABASE_URL" < latest_backup.sql
+   ```
+
+2. **Deploy Services**
+   ```bash
+   docker-compose up -d
+   ```
+
+3. **Verify Health**
+   ```bash
+   curl http://localhost:8000/health
+   curl http://localhost:8000/ready
+   ```
+
+4. **Run Smoke Tests**
+   ```bash
+   # Test WebSocket connection
+   # Test user authentication
+   # Test LLM proxy
+   ```
+
+5. **Enable Traffic**
+   - Update DNS/Load balancer
+   - Monitor for errors
+
+---
+
+## Troubleshooting
+
+### Common Issues
+
+#### "Authentication failed" on WebSocket
+```bash
+# Check JWT_SECRET matches between client config and server
+# Verify token hasn't expired
+# Check LOG_LEVEL=debug for detailed auth errors
+```
+
+#### "Redis connection refused"
+```bash
+# Check Redis is running
+redis-cli ping
+
+# Check REDIS_URL format
+# redis://[:password@]host:port[/db]
+```
+
+#### "Database connection failed"
+```bash
+# Test connection
+psql "$DATABASE_URL" -c "SELECT 1"
+
+# Check SSL mode for cloud databases
+# ?sslmode=require
+```
+
+#### "LLM request failed"
+```bash
+# Check API key is valid
+curl https://api.anthropic.com/v1/messages \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "anthropic-version: 2023-06-01"
+
+# Check rate limits haven't been exceeded
+```
+
+#### High Memory Usage
+```bash
+# Check Redis memory
+redis-cli INFO memory
+
+# Check for checkpoint accumulation
+psql "$DATABASE_URL" -c "
+  SELECT COUNT(*),
+         SUM(LENGTH(ciphertext_base64)) as total_size
+  FROM context_checkpoints;
+"
+
+# Run cleanup
+psql "$DATABASE_URL" -c "SELECT cleanup_expired_checkpoints();"
+```
+
+### Debug Mode
+
+```bash
+# Enable debug logging
+LOG_LEVEL=debug docker-compose up
+
+# Or for specific container
+docker-compose exec gateway env LOG_LEVEL=debug uvicorn ...
+```
+
+### Getting Help
+
+- **Bug Reports**: bugs@glock.dev
+- **Documentation**: https://docs.glock.dev
+- **Email**: support@glock.dev
+
+---
+
+## Appendix: Quick Reference
+
+### Essential Commands
+
+```bash
+# Start services
+docker-compose up -d
+
+# View logs
+docker-compose logs -f gateway
+
+# Check health
+curl http://localhost:8000/health
+
+# Connect to database
+psql "$DATABASE_URL"
+
+# Connect to Redis
+redis-cli -u "$REDIS_URL"
+
+# Run migrations
+psql "$DATABASE_URL" -f infra/supabase/migrations/XXXX.sql
+
+# Clean expired data
+psql "$DATABASE_URL" -c "SELECT cleanup_expired_checkpoints();"
+```
+
+### Environment Variable Quick Reference
+
+```bash
+# Required
+DATABASE_URL=postgresql://user:pass@host:5432/db
+REDIS_URL=redis://host:6379
+JWT_SECRET=$(openssl rand -hex 32)
+CONTEXT_MASTER_KEY=$(openssl rand -hex 32)
+ANTHROPIC_API_KEY=sk-ant-...
+
+# Optional
+LOG_LEVEL=info
+JWT_ISSUER=glock.dev
+ACCESS_TOKEN_EXPIRE_MINUTES=60
+REFRESH_TOKEN_EXPIRE_DAYS=30
+```

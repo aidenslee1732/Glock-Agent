@@ -230,10 +230,82 @@ class RedisClient:
     # Rate Limiting
     # =========================================================================
 
+    # Lua script for atomic rate limit check-and-increment
+    # This prevents race conditions where multiple concurrent requests
+    # could all pass the check before any increment the counter
+    RATE_LIMIT_SCRIPT = """
+    local minute_key = KEYS[1]
+    local hour_key = KEYS[2]
+    local limit_per_minute = tonumber(ARGV[1])
+    local limit_per_hour = tonumber(ARGV[2])
+    local minute_ttl = tonumber(ARGV[3])
+    local hour_ttl = tonumber(ARGV[4])
+
+    -- Get current counts
+    local minute_count = tonumber(redis.call("GET", minute_key) or "0")
+    local hour_count = tonumber(redis.call("GET", hour_key) or "0")
+
+    -- Check limits BEFORE incrementing
+    if minute_count >= limit_per_minute then
+        return {"0", "rate_limit_minute", minute_count, hour_count}
+    end
+    if hour_count >= limit_per_hour then
+        return {"0", "rate_limit_hour", minute_count, hour_count}
+    end
+
+    -- Atomically increment and set TTL
+    local new_minute = redis.call("INCR", minute_key)
+    if new_minute == 1 then
+        redis.call("EXPIRE", minute_key, minute_ttl)
+    end
+
+    local new_hour = redis.call("INCR", hour_key)
+    if new_hour == 1 then
+        redis.call("EXPIRE", hour_key, hour_ttl)
+    end
+
+    return {"1", "", new_minute, new_hour}
+    """
+
+    async def check_and_increment_rate_limit(
+        self, user_id: str, limit_per_minute: int, limit_per_hour: int
+    ) -> tuple[bool, str]:
+        """Atomically check and increment rate limits.
+
+        Uses a Lua script to prevent race conditions where multiple
+        concurrent requests could bypass rate limits.
+
+        Returns (allowed, reason).
+        """
+        minute_key = f"rate:{user_id}:minute"
+        hour_key = f"rate:{user_id}:hour"
+
+        result = await self.client.eval(
+            self.RATE_LIMIT_SCRIPT,
+            2,  # Number of keys
+            minute_key,
+            hour_key,
+            limit_per_minute,
+            limit_per_hour,
+            REDIS_TTLS["rate:minute"],
+            REDIS_TTLS["rate:hour"],
+        )
+
+        allowed = result[0] == "1"
+        reason = result[1] if isinstance(result[1], str) else result[1].decode() if result[1] else ""
+
+        return allowed, reason
+
     async def check_rate_limit(
         self, user_id: str, limit_per_minute: int, limit_per_hour: int
     ) -> tuple[bool, str]:
-        """Check rate limits. Returns (allowed, reason)."""
+        """Check rate limits without incrementing (read-only).
+
+        Note: For most use cases, prefer check_and_increment_rate_limit()
+        which is atomic and prevents race conditions.
+
+        Returns (allowed, reason).
+        """
         pipe = self.client.pipeline()
         minute_key = f"rate:{user_id}:minute"
         hour_key = f"rate:{user_id}:hour"
@@ -254,7 +326,11 @@ class RedisClient:
         return True, ""
 
     async def increment_rate_counters(self, user_id: str) -> None:
-        """Increment rate limit counters."""
+        """Increment rate limit counters.
+
+        Note: For most use cases, prefer check_and_increment_rate_limit()
+        which is atomic and prevents race conditions.
+        """
         pipe = self.client.pipeline()
         minute_key = f"rate:{user_id}:minute"
         hour_key = f"rate:{user_id}:hour"

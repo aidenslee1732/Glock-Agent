@@ -76,6 +76,9 @@ class LoopContext:
     start_time: Optional[datetime] = None
     last_activity: Optional[datetime] = None
 
+    # Attempt tracking (incremented on recovery from checkpoint)
+    attempt_no: int = 1
+
     # Error tracking
     consecutive_errors: int = 0
     max_consecutive_errors: int = 5
@@ -149,16 +152,40 @@ class AgenticLoop:
         session_id: str,
         task_id: str,
         plan: CompiledPlan,
-        workspace_path: Path
+        workspace_path: Path,
+        resume_from_checkpoint: bool = False
     ) -> None:
-        """Start executing a new task."""
+        """Start executing a new task.
+
+        Args:
+            session_id: Session ID
+            task_id: Task ID
+            plan: Compiled plan to execute
+            workspace_path: Workspace directory
+            resume_from_checkpoint: If True, try to resume from last checkpoint
+        """
+        # Determine attempt number
+        attempt_no = 1
+        tool_calls_made = 0
+
+        if resume_from_checkpoint:
+            checkpoint = self.state_store.get_latest_checkpoint(task_id, 'tool_queue')
+            if checkpoint:
+                # Increment attempt number from last checkpoint
+                attempt_no = checkpoint.attempt_no + 1
+                # Restore tool call count for accurate stats
+                tool_calls_made = checkpoint.payload.get('tool_calls_made', 0)
+                logger.info(f"Resuming task {task_id} from checkpoint (attempt {attempt_no})")
+
         self.context = LoopContext(
             session_id=session_id,
             task_id=task_id,
             plan=plan,
             workspace_path=workspace_path,
             state=LoopState.WAITING_TASK,
-            start_time=datetime.utcnow()
+            start_time=datetime.utcnow(),
+            attempt_no=attempt_no,
+            tool_calls_made=tool_calls_made
         )
 
         # Set up plan enforcer with this plan
@@ -167,7 +194,7 @@ class AgenticLoop:
         self._running = True
         await self._emit('task_started', task_id, plan)
 
-        logger.info(f"Started task loop for {task_id}")
+        logger.info(f"Started task loop for {task_id} (attempt {attempt_no})")
 
     async def handle_tool_request(self, request: ToolRequest) -> None:
         """Handle incoming tool request from server."""
@@ -397,7 +424,7 @@ class AgenticLoop:
             task_id=self.context.task_id,
             session_id=self.context.session_id,
             checkpoint_type='tool_queue',
-            attempt_no=1,  # TODO: Track attempt number
+            attempt_no=self.context.attempt_no,
             payload={
                 'tool_calls_made': self.context.tool_calls_made,
                 'state': self.context.state.value,
@@ -407,7 +434,7 @@ class AgenticLoop:
         )
 
         self.state_store.save_checkpoint(checkpoint)
-        logger.debug(f"Saved checkpoint at tool call {self.context.tool_calls_made}")
+        logger.debug(f"Saved checkpoint at tool call {self.context.tool_calls_made} (attempt {self.context.attempt_no})")
 
     async def _handle_error_threshold_exceeded(self) -> None:
         """Handle when error threshold is exceeded."""

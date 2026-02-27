@@ -15,6 +15,8 @@ import base64
 import hashlib
 import logging
 import os
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -24,6 +26,10 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 
 logger = logging.getLogger(__name__)
+
+# Cache configuration
+MAX_CACHED_KEYS = 100  # Maximum number of session keys to cache
+KEY_TTL_SECONDS = 3600  # Keys expire after 1 hour of inactivity
 
 
 @dataclass
@@ -69,13 +75,20 @@ class SessionKeyManager:
     - Checkpoints are integrity-protected
     """
 
-    def __init__(self, master_token: Optional[str] = None):
+    def __init__(
+        self,
+        master_token: Optional[str] = None,
+        max_cached_keys: int = MAX_CACHED_KEYS,
+        key_ttl_seconds: int = KEY_TTL_SECONDS,
+    ):
         """
         Initialize key manager.
 
         Args:
             master_token: The authentication token (JWT or API key)
                          If not provided, generates a random key for testing
+            max_cached_keys: Maximum number of session keys to cache (LRU eviction)
+            key_ttl_seconds: Time-to-live for cached keys in seconds
         """
         if master_token:
             # Derive master key from token
@@ -85,8 +98,11 @@ class SessionKeyManager:
             logger.warning("No master token provided, using random key")
             self._master_key = os.urandom(32)
 
-        # Cache derived session keys
-        self._session_keys: dict[str, bytes] = {}
+        # LRU cache for derived session keys with TTL
+        # Format: {cache_key: (derived_key, timestamp)}
+        self._session_keys: OrderedDict[str, Tuple[bytes, float]] = OrderedDict()
+        self._max_cached_keys = max_cached_keys
+        self._key_ttl_seconds = key_ttl_seconds
 
     def _derive_master_key(self, token: str) -> bytes:
         """Derive master key from authentication token."""
@@ -111,10 +127,28 @@ class SessionKeyManager:
             32-byte derived key for AES-256
         """
         cache_key = f"{session_id}:{user_id}"
+        current_time = time.time()
 
-        # Check cache
+        # Check cache with TTL validation
         if cache_key in self._session_keys:
-            return self._session_keys[cache_key]
+            derived_key, timestamp = self._session_keys[cache_key]
+
+            # Check if key is still valid (not expired)
+            if current_time - timestamp < self._key_ttl_seconds:
+                # Move to end (most recently used) and update timestamp
+                self._session_keys.move_to_end(cache_key)
+                self._session_keys[cache_key] = (derived_key, current_time)
+                return derived_key
+            else:
+                # Key expired, remove it
+                del self._session_keys[cache_key]
+                logger.debug(f"Session key expired and removed: {cache_key[:20]}...")
+
+        # Evict oldest entries if cache is full
+        self._evict_if_needed()
+
+        # Clean up any expired keys periodically
+        self._cleanup_expired_keys()
 
         # Derive new key
         info = f"glock:context:v1:{session_id}:{user_id}".encode()
@@ -129,10 +163,32 @@ class SessionKeyManager:
 
         derived_key = hkdf.derive(self._master_key[16:])
 
-        # Cache for performance
-        self._session_keys[cache_key] = derived_key
+        # Cache with timestamp for LRU + TTL
+        self._session_keys[cache_key] = (derived_key, current_time)
 
         return derived_key
+
+    def _evict_if_needed(self) -> None:
+        """Evict oldest entries if cache exceeds max size."""
+        while len(self._session_keys) >= self._max_cached_keys:
+            # Remove oldest (first) entry
+            oldest_key, _ = self._session_keys.popitem(last=False)
+            logger.debug(f"Evicted oldest session key from cache: {oldest_key[:20]}...")
+
+    def _cleanup_expired_keys(self) -> None:
+        """Remove expired keys from cache."""
+        current_time = time.time()
+        expired_keys = []
+
+        for cache_key, (_, timestamp) in self._session_keys.items():
+            if current_time - timestamp >= self._key_ttl_seconds:
+                expired_keys.append(cache_key)
+
+        for key in expired_keys:
+            del self._session_keys[key]
+
+        if expired_keys:
+            logger.debug(f"Cleaned up {len(expired_keys)} expired session keys")
 
     def encrypt_checkpoint(
         self,
@@ -273,7 +329,22 @@ class SessionKeyManager:
 
     def clear_cache(self) -> None:
         """Clear cached session keys."""
+        count = len(self._session_keys)
         self._session_keys.clear()
+        if count > 0:
+            logger.debug(f"Cleared {count} cached session keys")
+
+    def cache_stats(self) -> dict:
+        """Get cache statistics for monitoring.
+
+        Returns:
+            Dict with cache size, max size, and TTL settings
+        """
+        return {
+            "cached_keys": len(self._session_keys),
+            "max_cached_keys": self._max_cached_keys,
+            "key_ttl_seconds": self._key_ttl_seconds,
+        }
 
     def rotate_master_key(self, new_token: str) -> None:
         """

@@ -17,8 +17,9 @@ from contextlib import asynccontextmanager
 from typing import Any, Optional
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.websockets import WebSocketState
 
 # Configure logging
 log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -115,6 +116,10 @@ class MockRedisClient:
         """Mock rate limit check - always allow in dev mode."""
         return True, ""
 
+    async def check_and_increment_rate_limit(self, user_id: str, per_minute: int, per_hour: int) -> tuple[bool, str]:
+        """Mock atomic rate limit check - always allow in dev mode."""
+        return True, ""
+
     async def count_user_sessions(self, user_id: str) -> int:
         """Count user sessions."""
         count = 0
@@ -195,6 +200,7 @@ class MockPostgresClient:
         self._tasks = {}
         self._users = {}
         self._checkpoints = {}
+        self._errors = {}
         logger.info("Using MockPostgresClient (DEV MODE)")
 
     async def connect(self):
@@ -272,6 +278,38 @@ class MockPostgresClient:
     async def record_usage(self, **kwargs):
         pass
 
+    async def store_error(
+        self,
+        error_id: str,
+        error_type: str,
+        error_message: str,
+        stack_trace: str,
+        severity: str = "error",
+        component: str = None,
+        user_id: str = None,
+        session_id: str = None,
+        task_id: str = None,
+        request_id: str = None,
+        context: dict = None,
+    ) -> dict:
+        """Mock error storage - just logs in dev mode."""
+        self._errors[error_id] = {
+            "id": error_id,
+            "error_type": error_type,
+            "error_message": error_message,
+            "severity": severity,
+            "component": component,
+            "created_at": time.time(),
+        }
+        logger.info(f"[MockDB] Stored error {error_id}: {error_type}")
+        return self._errors[error_id]
+
+    async def get_recent_errors(self, limit: int = 100, **kwargs) -> list:
+        """Get recent errors from mock storage."""
+        errors = list(self._errors.values())
+        errors.sort(key=lambda x: x.get("created_at", 0), reverse=True)
+        return errors[:limit]
+
 
 def get_storage_clients():
     """Get Redis and Postgres clients (real or mock based on DEV_MODE)."""
@@ -311,6 +349,11 @@ async def lifespan(app: FastAPI):
         await redis_client.connect()
         await postgres_client.connect()
 
+    # Initialize error store
+    from apps.server.src.errors.handler import init_error_store
+    init_error_store(postgres_client)
+    logger.info("Error store initialized")
+
     # Initialize components
     from apps.server.src.gateway.ws.router import SessionRouter
     from apps.server.src.gateway.ws.replay import ReplayManager
@@ -329,8 +372,16 @@ async def lifespan(app: FastAPI):
         )
         logger.info("Model B LLM handler initialized")
     except ImportError as e:
-        logger.warning(f"Could not initialize Model B components: {e}")
-        llm_handler = None
+        # In production, this is a critical error that should not be silently ignored
+        if DEV_MODE:
+            logger.warning(f"Could not initialize Model B components (dev mode): {e}")
+            llm_handler = None
+        else:
+            logger.error(f"Failed to initialize LLM handler: {e}")
+            raise RuntimeError(
+                f"Critical component initialization failed: LLMHandler. "
+                f"Cannot start server without LLM capabilities. Error: {e}"
+            ) from e
 
     client_handler = ClientHandler(
         redis=redis_client,
@@ -401,23 +452,46 @@ async def ready():
 
 # WebSocket endpoints
 @app.websocket("/ws/client")
-async def websocket_client(websocket: WebSocket):
-    """WebSocket endpoint for clients."""
-    await websocket.accept()
+async def websocket_client(
+    websocket: WebSocket,
+    token: str = Query(default=None, description="JWT access token"),
+):
+    """WebSocket endpoint for clients.
 
-    # Authentication
+    Authentication is done via JWT token passed as query parameter:
+    ws://host/ws/client?token=<jwt_token>
+
+    In dev mode (SKIP_AUTH=1), authentication is bypassed.
+    """
+    # Check if authentication should be skipped
     skip_auth = os.environ.get("SKIP_AUTH", "").lower() in ("1", "true", "yes") or DEV_MODE
 
     if skip_auth:
-        # Dev mode: use dummy user
+        # Dev mode: accept and use dummy user
+        await websocket.accept()
         user_id = "user_dev"
         user_email = "dev@glock.local"
         plan_tier = "pro"
+        logger.debug("WebSocket connection accepted (auth skipped - dev mode)")
     else:
-        # TODO: Implement proper JWT authentication
-        user_id = "user_test123"
-        user_email = "test@example.com"
-        plan_tier = "pro"
+        # Production mode: verify JWT token before accepting
+        from apps.server.src.gateway.api.auth import verify_websocket_token, AuthError
+
+        try:
+            token_payload = verify_websocket_token(token)
+            user_id = token_payload.user_id
+            user_email = token_payload.email
+            plan_tier = token_payload.plan_tier
+
+            # Accept the connection after successful authentication
+            await websocket.accept()
+            logger.info(f"WebSocket connection authenticated for user {user_id}")
+
+        except AuthError as e:
+            # Close connection with authentication error
+            await websocket.close(code=4001, reason=f"Authentication failed: {e.message}")
+            logger.warning(f"WebSocket authentication failed: {e.message} (code: {e.code})")
+            return
 
     try:
         await client_handler.handle_connection(
@@ -427,53 +501,140 @@ async def websocket_client(websocket: WebSocket):
             plan_tier=plan_tier,
         )
     except WebSocketDisconnect:
-        logger.info("Client disconnected")
+        logger.info(f"Client disconnected: {user_id}")
+
+
+# REST API authentication dependency
+from fastapi import Header
+
+
+async def get_authenticated_user(
+    authorization: str = Header(default=None, description="Bearer token"),
+) -> dict:
+    """Authenticate user from Authorization header.
+
+    Returns user info dict with user_id, email, plan_tier.
+    In dev mode, returns dummy user.
+    """
+    skip_auth = os.environ.get("SKIP_AUTH", "").lower() in ("1", "true", "yes") or DEV_MODE
+
+    if skip_auth:
+        return {
+            "user_id": "user_dev",
+            "email": "dev@glock.local",
+            "plan_tier": "pro",
+        }
+
+    # Production: verify JWT
+    from apps.server.src.gateway.api.auth import verify_token, AuthError
+
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or invalid Authorization header",
+        )
+
+    token = authorization[7:]  # Remove "Bearer " prefix
+
+    try:
+        payload = verify_token(token, require_type="access")
+        return {
+            "user_id": payload.user_id,
+            "email": payload.email,
+            "plan_tier": payload.plan_tier,
+        }
+    except AuthError as e:
+        raise HTTPException(
+            status_code=401,
+            detail=e.message,
+        )
 
 
 # REST API endpoints
 @app.get("/api/v1/sessions")
-async def list_sessions(user_id: str = "user_dev"):
+async def list_sessions(user: dict = Depends(get_authenticated_user)):
     """List user's sessions."""
-    sessions = await postgres_client.get_user_sessions(user_id)
+    sessions = await postgres_client.get_user_sessions(user["user_id"])
     return {"sessions": sessions}
 
 
 @app.get("/api/v1/sessions/{session_id}")
-async def get_session(session_id: str):
-    """Get session details."""
+async def get_session(
+    session_id: str,
+    user: dict = Depends(get_authenticated_user),
+):
+    """Get session details (only if owned by user)."""
     session = await postgres_client.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+
+    # Ownership check
+    if session.get("user_id") != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+
     return session
 
 
 @app.delete("/api/v1/sessions/{session_id}")
-async def end_session(session_id: str):
-    """End a session."""
+async def end_session(
+    session_id: str,
+    user: dict = Depends(get_authenticated_user),
+):
+    """End a session (only if owned by user)."""
+    session = await postgres_client.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Ownership check
+    if session.get("user_id") != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+
     await postgres_client.end_session(session_id)
     return {"status": "ended"}
 
 
 @app.get("/api/v1/tasks/{task_id}")
-async def get_task(task_id: str):
-    """Get task details."""
+async def get_task(
+    task_id: str,
+    user: dict = Depends(get_authenticated_user),
+):
+    """Get task details (only if owned by user via session)."""
     task = await postgres_client.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+
+    # Get session to verify ownership
+    session = await postgres_client.get_session(task.get("session_id"))
+    if session and session.get("user_id") != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+
     return task
 
 
 @app.post("/api/v1/tasks/{task_id}/cancel")
-async def cancel_task(task_id: str):
-    """Cancel a running task."""
+async def cancel_task(
+    task_id: str,
+    user: dict = Depends(get_authenticated_user),
+):
+    """Cancel a running task (only if owned by user via session)."""
+    task = await postgres_client.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    # Get session to verify ownership
+    session = await postgres_client.get_session(task.get("session_id"))
+    if session and session.get("user_id") != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+
     await postgres_client.update_task_status(task_id, "cancelled")
     return {"status": "cancelled"}
 
 
 @app.get("/api/v1/profile/usage")
-async def get_usage(user_id: str = "user_dev"):
+async def get_usage(user: dict = Depends(get_authenticated_user)):
     """Get user's usage summary."""
     return {
+        "user_id": user["user_id"],
         "tokens_used": 0,
         "tasks_completed": 0,
         "sessions_count": 0,

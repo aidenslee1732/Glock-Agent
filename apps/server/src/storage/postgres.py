@@ -611,6 +611,126 @@ class PostgresClient:
         )
 
     # =========================================================================
+    # Errors
+    # =========================================================================
+
+    async def store_error(
+        self,
+        error_id: str,
+        error_type: str,
+        error_message: str,
+        stack_trace: str,
+        severity: str = "error",
+        component: Optional[str] = None,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+        context: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Store an error in the errors table for analysis and debugging.
+
+        Args:
+            error_id: Unique error identifier
+            error_type: Type/class of the error (e.g., 'CommandInjectionError')
+            error_message: The error message
+            stack_trace: Full stack trace
+            severity: Error severity ('critical', 'error', 'warning')
+            component: Component where error occurred (e.g., 'hooks', 'llm_handler')
+            user_id: User ID if available
+            session_id: Session ID if available
+            task_id: Task ID if available
+            request_id: Request ID if available
+            context: Additional context as JSON
+
+        Returns:
+            Dict with stored error info
+        """
+        import json
+        row = await self.pool.fetchrow(
+            """
+            INSERT INTO errors (
+                id, error_type, error_message, stack_trace, severity,
+                component, user_id, session_id, task_id, request_id, context
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            RETURNING id, error_type, severity, component, created_at
+            """,
+            error_id,
+            error_type,
+            error_message[:2000],  # Truncate message if too long
+            stack_trace[:10000],   # Truncate stack trace if too long
+            severity,
+            component,
+            UUID(user_id) if user_id else None,
+            UUID(session_id.replace("sess_", "")) if session_id else None,
+            UUID(task_id.replace("task_", "")) if task_id else None,
+            request_id,
+            json.dumps(context or {}),
+        )
+        return dict(row)
+
+    async def get_recent_errors(
+        self,
+        limit: int = 100,
+        severity: Optional[str] = None,
+        component: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Get recent errors for monitoring/debugging."""
+        if severity and component:
+            rows = await self.pool.fetch(
+                """
+                SELECT id, error_type, error_message, severity, component,
+                       user_id, session_id, task_id, created_at
+                FROM errors
+                WHERE severity = $1 AND component = $2
+                ORDER BY created_at DESC
+                LIMIT $3
+                """,
+                severity,
+                component,
+                limit,
+            )
+        elif severity:
+            rows = await self.pool.fetch(
+                """
+                SELECT id, error_type, error_message, severity, component,
+                       user_id, session_id, task_id, created_at
+                FROM errors
+                WHERE severity = $1
+                ORDER BY created_at DESC
+                LIMIT $2
+                """,
+                severity,
+                limit,
+            )
+        elif component:
+            rows = await self.pool.fetch(
+                """
+                SELECT id, error_type, error_message, severity, component,
+                       user_id, session_id, task_id, created_at
+                FROM errors
+                WHERE component = $1
+                ORDER BY created_at DESC
+                LIMIT $2
+                """,
+                component,
+                limit,
+            )
+        else:
+            rows = await self.pool.fetch(
+                """
+                SELECT id, error_type, error_message, severity, component,
+                       user_id, session_id, task_id, created_at
+                FROM errors
+                ORDER BY created_at DESC
+                LIMIT $1
+                """,
+                limit,
+            )
+        return [dict(row) for row in rows]
+
+    # =========================================================================
     # Session Checkpoints
     # =========================================================================
 

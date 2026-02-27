@@ -380,7 +380,8 @@ start_cli() {
 
     export PYTHONPATH="$PROJECT_DIR:$PYTHONPATH"
     cd "$PROJECT_DIR"
-    python -m apps.cli.src.cli.main "${@}"
+    # Use the package __main__.py to avoid import warning
+    python -m apps.cli.src.cli "${@}"
 }
 
 # Main command handler

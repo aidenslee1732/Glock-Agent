@@ -24,6 +24,13 @@ from apps.server.src.storage.redis import RedisClient
 from apps.server.src.storage.postgres import PostgresClient
 from apps.server.src.gateway.protocol import GatewayProtocol, ClientSanitizer
 
+# Input validation constants
+MAX_ACK_VALUE = 2**31 - 1  # Reasonable upper bound for sequence numbers
+MIN_ACK_VALUE = 0
+MAX_PAYLOAD_SIZE = 10 * 1024 * 1024  # 10 MB max payload size
+MAX_SESSION_ID_LENGTH = 64
+MAX_STRING_FIELD_LENGTH = 4096
+
 from .router import SessionRouter
 from .replay import ReplayManager
 
@@ -139,6 +146,52 @@ class ClientHandler:
             # Cleanup
             await self._handle_disconnect(conn_id)
 
+    def _validate_message(self, msg: MessageEnvelope, raw_size: int) -> tuple[bool, str]:
+        """Validate message structure and field values.
+
+        Returns (is_valid, error_message).
+        """
+        # Validate payload size
+        if raw_size > MAX_PAYLOAD_SIZE:
+            return False, f"Payload too large: {raw_size} bytes (max {MAX_PAYLOAD_SIZE})"
+
+        # Validate ack field range
+        if not isinstance(msg.ack, int):
+            return False, "Invalid ack field: must be integer"
+        if msg.ack < MIN_ACK_VALUE or msg.ack > MAX_ACK_VALUE:
+            return False, f"Invalid ack value: {msg.ack} (must be {MIN_ACK_VALUE}-{MAX_ACK_VALUE})"
+
+        # Validate seq field range
+        if not isinstance(msg.seq, int):
+            return False, "Invalid seq field: must be integer"
+        if msg.seq < MIN_ACK_VALUE or msg.seq > MAX_ACK_VALUE:
+            return False, f"Invalid seq value: {msg.seq} (must be {MIN_ACK_VALUE}-{MAX_ACK_VALUE})"
+
+        # Validate session_id length
+        if msg.session_id and len(msg.session_id) > MAX_SESSION_ID_LENGTH:
+            return False, f"Session ID too long: {len(msg.session_id)} chars"
+
+        # Validate message type is known
+        if msg.type is None:
+            return False, "Missing message type"
+
+        # Validate payload structure based on message type
+        if msg.payload is not None:
+            if not isinstance(msg.payload, (dict, str)):
+                return False, "Invalid payload: must be dict or string"
+
+            # For string payloads, check length
+            if isinstance(msg.payload, str) and len(msg.payload) > MAX_PAYLOAD_SIZE:
+                return False, "Payload string too long"
+
+            # For dict payloads, validate expected fields exist for critical message types
+            if isinstance(msg.payload, dict):
+                if msg.type == MessageType.RESUME_REQUEST:
+                    if "session_id" not in msg.payload:
+                        return False, "RESUME_REQUEST missing required field: session_id"
+
+        return True, ""
+
     async def _handle_message(self, conn_id: str, raw_message: str | bytes) -> None:
         """Handle incoming client message."""
         conn = self._connections.get(conn_id)
@@ -146,10 +199,30 @@ class ClientHandler:
             return
 
         try:
+            # Check raw message size before parsing
+            raw_size = len(raw_message) if isinstance(raw_message, (str, bytes)) else 0
+            if raw_size > MAX_PAYLOAD_SIZE:
+                logger.warning(f"Message too large from client: {raw_size} bytes")
+                await self._send_error(
+                    conn["websocket"], "", "payload_too_large",
+                    f"Message exceeds maximum size of {MAX_PAYLOAD_SIZE} bytes"
+                )
+                return
+
             msg = GatewayProtocol.parse_message(raw_message)
+
+            # Validate message structure
+            is_valid, error_msg = self._validate_message(msg, raw_size)
+            if not is_valid:
+                logger.warning(f"Invalid message from client: {error_msg}")
+                await self._send_error(
+                    conn["websocket"], msg.session_id or "", "invalid_message", error_msg
+                )
+                return
+
             conn["last_message_at"] = time.time()
 
-            # Update client ack
+            # Update client ack (already validated above)
             if msg.ack > 0:
                 conn["client_ack"] = msg.ack
 
@@ -197,8 +270,8 @@ class ClientHandler:
         user_id = conn["user_id"]
         websocket = conn["websocket"]
 
-        # Check rate limits
-        allowed, reason = await self.redis.check_rate_limit(
+        # Atomically check and increment rate limits (prevents race condition bypass)
+        allowed, reason = await self.redis.check_and_increment_rate_limit(
             user_id,
             RATE_LIMIT_PER_MINUTE,
             RATE_LIMIT_PER_HOUR,
@@ -275,8 +348,7 @@ class ClientHandler:
             conn["plan_tier"],
         )
 
-        # Increment rate counters
-        await self.redis.increment_rate_counters(user_id)
+        # Rate counters already incremented atomically in check_and_increment_rate_limit()
 
         logger.info(f"Session started: session={session_id}, user={user_id}")
 
