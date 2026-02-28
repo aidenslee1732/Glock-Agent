@@ -188,7 +188,11 @@ start_dev_mode() {
     echo ""
 
     cd "$PROJECT_DIR"
-    uvicorn apps.server.src.main:app --host 0.0.0.0 --port 8000 --reload
+    # Only reload on server code changes, not when user projects are modified
+    # This prevents session loss when Glock writes files to user workspaces
+    uvicorn apps.server.src.main:app --host 0.0.0.0 --port 8000 --reload \
+        --reload-dir apps/server/src \
+        --reload-dir packages/shared_protocol
 }
 
 # Start the server (requires Redis/DB)
@@ -229,7 +233,10 @@ start_server() {
     echo ""
 
     cd "$PROJECT_DIR"
-    uvicorn apps.server.src.main:app --host 0.0.0.0 --port 8000 --reload
+    # Only reload on server code changes, not when user projects are modified
+    uvicorn apps.server.src.main:app --host 0.0.0.0 --port 8000 --reload \
+        --reload-dir apps/server/src \
+        --reload-dir packages/shared_protocol
 }
 
 # Run tests
@@ -380,8 +387,23 @@ start_cli() {
 
     export PYTHONPATH="$PROJECT_DIR:$PYTHONPATH"
     cd "$PROJECT_DIR"
-    # Use the package __main__.py to avoid import warning
-    python -m apps.cli.src.cli "${@}"
+    
+    # Check if --server argument is already provided
+    local has_server_arg=false
+    for arg in "$@"; do
+        if [[ "$arg" == "--server" ]] || [[ "$arg" == "--server="* ]]; then
+            has_server_arg=true
+            break
+        fi
+    done
+    
+    # If no --server argument provided, add default localhost WebSocket server
+    if [[ "$has_server_arg" == false ]]; then
+        echo "Using default server: ws://localhost:8000"
+        python -m apps.cli.src.cli --server "ws://localhost:8000" "${@}"
+    else
+        python -m apps.cli.src.cli "${@}"
+    fi
 }
 
 # Main command handler

@@ -261,14 +261,14 @@ FRAMEWORK_AGENTS: dict[str, AgentConfig] = {
 CORE_DEV_AGENTS: dict[str, AgentConfig] = {
     "frontend": AgentConfig(
         name="frontend",
-        description="Frontend UI/UX development specialist.",
+        description="Frontend UI/UX development specialist. Default stack: Next.js + TypeScript + Tailwind + shadcn/ui.",
         system_prompt_file="core/frontend.md",
         category="core-dev",
         aliases=["ui", "ux", "front-end"],
     ),
     "backend": AgentConfig(
         name="backend",
-        description="Backend services & APIs specialist.",
+        description="Backend services & APIs specialist. Default stack: FastAPI + Python.",
         system_prompt_file="core/backend.md",
         category="core-dev",
         aliases=["api", "server", "back-end"],
@@ -290,7 +290,7 @@ CORE_DEV_AGENTS: dict[str, AgentConfig] = {
     ),
     "fullstack": AgentConfig(
         name="fullstack",
-        description="End-to-end feature implementation specialist.",
+        description="End-to-end feature implementation specialist. Default stack: Next.js + TypeScript + shadcn/ui (frontend) and FastAPI + Python (backend).",
         system_prompt_file="core/fullstack.md",
         category="core-dev",
         aliases=["full-stack"],

@@ -378,6 +378,25 @@ class BackgroundTaskRunner:
         all_tasks = self.store.list_background_tasks()
         return all_tasks[:limit]
 
+    async def stop_all(self) -> int:
+        """Stop all running background tasks.
+
+        Returns:
+            Number of tasks stopped
+        """
+        stopped = 0
+        task_ids = list(self._running_tasks.keys())
+
+        for task_id in task_ids:
+            try:
+                result = await self.stop_task(task_id)
+                if result.get("status") == "success":
+                    stopped += 1
+            except Exception as e:
+                logger.warning(f"Failed to stop task {task_id}: {e}")
+
+        return stopped
+
     async def cleanup_completed(self, max_age_hours: int = 24) -> int:
         """Clean up old completed task output files.
 

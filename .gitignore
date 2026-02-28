@@ -1,5 +1,9 @@
 # Glock .gitignore
 
+# User project folders (created by Glock)
+calc/
+rumpum/
+
 # Environment and secrets
 .env
 .env.local

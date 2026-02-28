@@ -25,6 +25,9 @@ try:
     import litellm
     from litellm import acompletion
     LITELLM_AVAILABLE = True
+    # Allow LiteLLM to modify params when messages contain tool_calls but no tools provided
+    # This prevents "Anthropic doesn't support tool calling without tools= param" errors
+    litellm.modify_params = True
 except ImportError:
     LITELLM_AVAILABLE = False
 
