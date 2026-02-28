@@ -71,6 +71,7 @@ class DeltaBuilder:
 
     def add_user_message(self, content: str) -> None:
         """Add a user message."""
+        logger.debug(f"add_user_message: content_len={len(content)}")
         self._messages.append(ConversationMessage(
             role="user",
             content=content,
@@ -83,6 +84,7 @@ class DeltaBuilder:
         tool_calls: Optional[list[dict[str, Any]]] = None,
     ) -> None:
         """Add an assistant message."""
+        logger.debug(f"add_assistant_message: content_len={len(content) if content else 0}, tool_calls={len(tool_calls) if tool_calls else 0}")
         self._messages.append(ConversationMessage(
             role="assistant",
             content=content,
@@ -110,28 +112,46 @@ class DeltaBuilder:
             logger.warning("No messages to attach tool result to")
             return
 
+        logger.debug(f"add_tool_result: tool={tool_name}, id={tool_call_id}, last_msg_role={self._messages[-1].role}")
+
         # Compress if needed
         if compress and self.config.compress_tool_outputs:
             result = self.compressor.compress(tool_name, result)
 
+        # Build tool result in the format expected by the server:
+        # Server's _format_tool_result_content expects {"tool_name", "status", "result"}
         tool_result = {
             "tool_call_id": tool_call_id,
             "tool_name": tool_name,
-            **result,
+            "status": result.get("status", "success"),
+            "result": result.get("result", result),  # Use nested result if present, else whole result
         }
 
         # Attach to last message
         self._messages[-1].tool_results.append(tool_result)
 
-    def build(self) -> ContextDelta:
+    def build(self, include_all: bool = True) -> ContextDelta:
         """
         Build the context delta.
 
+        Args:
+            include_all: If True, include ALL messages (ignore checkpoint index).
+                         This is safer when checkpoint storage isn't reliable.
+
         Returns:
-            ContextDelta with messages since last checkpoint
+            ContextDelta with messages
         """
-        # Get messages since checkpoint
-        delta_messages = self._messages[self._checkpoint_index:]
+        # Include all messages for now - checkpoint storage is not reliable
+        # When checkpoints work properly, we can use self._checkpoint_index
+        if include_all:
+            delta_messages = self._messages
+        else:
+            delta_messages = self._messages[self._checkpoint_index:]
+
+        logger.debug(f"DeltaBuilder.build: {len(delta_messages)} messages, include_all={include_all}")
+        for i, msg in enumerate(delta_messages):
+            logger.debug(f"  [{i}] role={msg.role}, content_len={len(msg.content) if msg.content else 0}, "
+                        f"tool_calls={len(msg.tool_calls)}, tool_results={len(msg.tool_results)}")
 
         # Convert to Message objects
         messages: list[Message] = []

@@ -357,18 +357,21 @@ class OrchestrationEngine:
                         content=response_content,
                     )
 
-                    # Process through context packer
-                    if self._context_packer:
-                        self._context_packer.process_assistant_response(
-                            content=response_content,
-                            tool_calls=[tc.to_dict() for tc in tool_calls] if tool_calls else None,
-                        )
+                # Process through context packer (always, even without content)
+                if self._context_packer and (response_content or tool_calls):
+                    self._context_packer.process_assistant_response(
+                        content=response_content or "",
+                        tool_calls=[tc.to_dict() for tc in tool_calls] if tool_calls else None,
+                    )
 
-                    # Add assistant turn
+                # Add assistant turn if there's content OR tool_calls
+                # CRITICAL: Must add assistant turn for tool_calls even without text content,
+                # otherwise tool results won't be attached to any message
+                if response_content or tool_calls:
                     self._turns.append(ConversationTurn(
                         role="assistant",
-                        content=response_content,
-                        tool_calls=[tc.to_dict() for tc in tool_calls],
+                        content=response_content or "",
+                        tool_calls=[tc.to_dict() for tc in tool_calls] if tool_calls else [],
                     ))
 
                 # Process tool calls
@@ -452,12 +455,17 @@ class OrchestrationEngine:
                         )
 
                         # Process tool result through context packer
+                        # Wrap result with status so delta builder can format correctly
                         if self._context_packer:
+                            wrapped_result = {
+                                "status": status,
+                                "result": result if isinstance(result, dict) else {"output": result},
+                            }
                             self._context_packer.process_tool_result(
                                 tool_call_id=tool_call.tool_call_id,
                                 tool_name=tool_call.tool_name,
                                 args=tool_call.arguments,
-                                result=result if isinstance(result, dict) else {"output": result},
+                                result=wrapped_result,
                             )
 
                         # Add tool result to conversation
@@ -582,11 +590,16 @@ class OrchestrationEngine:
 
     def _delta_to_dict(self, delta: ContextDelta) -> dict[str, Any]:
         """Convert ContextDelta to dict."""
+        messages = []
+        for m in delta.messages:
+            msg = {"role": m.role, "content": m.content}
+            # CRITICAL: Include tool_calls for assistant messages
+            if m.tool_calls:
+                msg["tool_calls"] = m.tool_calls
+            messages.append(msg)
+
         return {
-            "messages": [
-                {"role": m.role, "content": m.content}
-                for m in delta.messages
-            ],
+            "messages": messages,
             "tool_results_compressed": delta.tool_results_compressed,
             "token_count": delta.token_count,
         }
@@ -898,12 +911,8 @@ class OrchestrationEngine:
                     f"Checkpoint encryption failed - cannot save session state securely: {e}"
                 ) from e
         else:
-            # SECURITY WARNING: No encryption available
-            # This should only happen in development/testing
-            logger.warning(
-                "SECURITY WARNING: Saving checkpoint WITHOUT encryption. "
-                "This is not recommended for production use."
-            )
+            # No encryption in dev mode - this is fine for local development
+            logger.debug("Checkpoint saved without encryption (dev mode)")
             encrypted_payload = payload_bytes
 
         # Send checkpoint via WebSocket client

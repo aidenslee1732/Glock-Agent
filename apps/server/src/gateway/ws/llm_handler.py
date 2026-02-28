@@ -493,6 +493,15 @@ class LLMHandler:
                 ))
                 added_tool_result_ids.add(tool_call_id)
 
+        # 5. Ensure at least one non-system message exists (Anthropic requirement)
+        has_non_system = any(m.role != "system" for m in messages)
+        if not has_non_system:
+            logger.warning("No non-system messages found, adding default user message")
+            messages.append(LLMMessage(
+                role="user",
+                content="Please continue with the current task.",
+            ))
+
         return messages
 
     def _convert_tool_calls(

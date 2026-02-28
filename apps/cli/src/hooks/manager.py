@@ -146,12 +146,16 @@ class HookManager:
         self,
         tool_name: str,
         result: dict[str, Any],
+        args: Optional[dict[str, Any]] = None,
+        success: bool = True,
     ) -> list[HookResult]:
         """Run post-tool-execute hooks.
 
         Args:
             tool_name: Name of tool that was executed
             result: Tool result
+            args: Tool arguments (optional)
+            success: Whether tool succeeded (optional)
 
         Returns:
             List of hook results
@@ -161,6 +165,8 @@ class HookManager:
             context={
                 "tool_name": tool_name,
                 "tool_result": str(result),
+                "tool_args": str(args) if args else "",
+                "tool_success": str(success),
             },
         )
 

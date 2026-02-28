@@ -159,6 +159,7 @@ class ToolBroker:
         hook_manager: Optional["HookManager"] = None,
     ):
         self.workspace_dir = Path(workspace_dir).resolve()
+        logger.info(f"ToolBroker initialized with workspace: {self.workspace_dir}")
         self._hook_manager: Optional["HookManager"] = hook_manager
         self._plan_mode: Optional["PlanMode"] = plan_mode
 
@@ -929,6 +930,7 @@ class ToolBroker:
         """List directory contents."""
         path = args.get("path", ".")
         dir_path = self._resolve_path(path)
+        logger.debug(f"list_directory: path={path}, resolved={dir_path}, workspace={self.workspace_dir}")
 
         if not self._check_path_safety(dir_path):
             raise ValueError(f"Path escapes workspace: {dir_path}")
@@ -943,6 +945,10 @@ class ToolBroker:
                 "type": "directory" if entry.is_dir() else "file",
                 "size": entry.stat().st_size if entry.is_file() else None,
             })
+
+        logger.info(f"list_directory: found {len(entries)} entries in {dir_path}")
+        if entries:
+            logger.debug(f"list_directory first 5: {[e['name'] for e in entries[:5]]}")
 
         return {
             "path": str(dir_path),
