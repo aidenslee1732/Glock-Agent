@@ -230,14 +230,19 @@ class LLMGateway:
         for attempt in range(self.config.max_retries):
             try:
                 if LITELLM_AVAILABLE:
-                    response = await acompletion(
-                        model=model,
-                        messages=messages_dict,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        tools=tools_dict,
-                        timeout=self.config.timeout_seconds
-                    )
+                    # Build kwargs conditionally - only include tools if we have them
+                    # Anthropic rejects requests with tool_choice but no tools
+                    completion_kwargs: dict[str, Any] = {
+                        "model": model,
+                        "messages": messages_dict,
+                        "max_tokens": max_tokens,
+                        "temperature": temperature,
+                        "timeout": self.config.timeout_seconds,
+                    }
+                    if tools_dict:
+                        completion_kwargs["tools"] = tools_dict
+
+                    response = await acompletion(**completion_kwargs)
                 else:
                     response = self._mock_response(messages_dict, tools_dict)
 
@@ -291,15 +296,20 @@ class LLMGateway:
 
         try:
             if LITELLM_AVAILABLE:
-                response = await acompletion(
-                    model=model,
-                    messages=messages_dict,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    tools=tools_dict,
-                    timeout=self.config.timeout_seconds,
-                    stream=True
-                )
+                # Build kwargs conditionally - only include tools if we have them
+                # Anthropic rejects requests with tool_choice but no tools
+                completion_kwargs: dict[str, Any] = {
+                    "model": model,
+                    "messages": messages_dict,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "timeout": self.config.timeout_seconds,
+                    "stream": True,
+                }
+                if tools_dict:
+                    completion_kwargs["tools"] = tools_dict
+
+                response = await acompletion(**completion_kwargs)
 
                 async for chunk in response:
                     delta = self._parse_stream_chunk(chunk)
