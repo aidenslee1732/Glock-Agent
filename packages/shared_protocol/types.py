@@ -148,6 +148,14 @@ class MessageType(str, Enum):
     SESSION_SYNC = "session_sync"            # Server → Client: Session state on resume
     SESSION_RESUME = "session_resume"        # Client → Server: Resume session
 
+    # ==========================================================================
+    # Council: Multi-Perspective Deliberation Messages
+    # ==========================================================================
+    COUNCIL_REQUEST = "council_request"      # Client → Server: Request council deliberation
+    COUNCIL_ACK = "council_ack"              # Server → Client: Deliberation started
+    COUNCIL_RESULT = "council_result"        # Server → Client: Deliberation complete
+    COUNCIL_ERROR = "council_error"          # Server → Client: Deliberation error
+
 
 # =============================================================================
 # Message Envelope
@@ -213,15 +221,36 @@ class MessageEnvelope:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MessageEnvelope:
-        """Create from dictionary."""
+        """Create from dictionary.
+
+        Bug fix 5.6: Explicit field validation with defaults instead of KeyError.
+        """
+        # Validate required fields
+        required_fields = ["v", "type", "session_id", "payload"]
+        missing = [f for f in required_fields if f not in data]
+        if missing:
+            raise ValueError(f"MessageEnvelope missing required fields: {missing}")
+
+        # Parse type safely
+        msg_type = data["type"]
+        if isinstance(msg_type, str):
+            try:
+                msg_type = MessageType(msg_type)
+            except ValueError:
+                raise ValueError(f"Invalid message type: {msg_type}")
+
+        # Use defaults for optional fields
+        import time
+        default_ts = int(time.time() * 1000)
+
         return cls(
             v=data["v"],
-            type=MessageType(data["type"]) if isinstance(data["type"], str) else data["type"],
+            type=msg_type,
             session_id=data["session_id"],
-            message_id=data["message_id"],
-            seq=data["seq"],
-            ack=data["ack"],
-            timestamp_ms=data["timestamp_ms"],
+            message_id=data.get("message_id", ""),
+            seq=data.get("seq", 0),
+            ack=data.get("ack", 0),
+            timestamp_ms=data.get("timestamp_ms", default_ts),
             payload=data["payload"],
             client_id=data.get("client_id"),
             task_id=data.get("task_id"),

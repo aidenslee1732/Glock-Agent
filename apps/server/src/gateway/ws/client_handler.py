@@ -42,6 +42,14 @@ except ImportError:
     LLMHandler = None
     HAS_LLM_HANDLER = False
 
+# Optional Council handler import
+try:
+    from .council_handler import CouncilHandler
+    HAS_COUNCIL_HANDLER = True
+except ImportError:
+    CouncilHandler = None
+    HAS_COUNCIL_HANDLER = False
+
 logger = logging.getLogger(__name__)
 
 # Configuration
@@ -86,6 +94,12 @@ class ClientHandler:
         else:
             self.llm_handler = None
             logger.warning("LLMHandler not available - LLM requests will fail")
+
+        # Council handler for multi-perspective deliberation
+        if HAS_COUNCIL_HANDLER and self.llm_handler:
+            self.council_handler = CouncilHandler(self.llm_handler.llm_gateway)
+        else:
+            self.council_handler = None
 
         self.sanitizer = ClientSanitizer()
 
@@ -198,6 +212,13 @@ class ClientHandler:
         if not conn:
             return
 
+        # Bug fix 1.6: Validate required connection keys exist before accessing
+        required_keys = ["websocket", "user_id"]
+        for key in required_keys:
+            if key not in conn:
+                logger.error(f"Missing required connection key '{key}' for conn={conn_id}")
+                return
+
         try:
             # Check raw message size before parsing
             raw_size = len(raw_message) if isinstance(raw_message, (str, bytes)) else 0
@@ -237,6 +258,8 @@ class ClientHandler:
                 MessageType.LLM_REQUEST: self._handle_llm_request,
                 MessageType.LLM_CANCEL: self._handle_llm_cancel,
                 MessageType.CONTEXT_CHECKPOINT: self._handle_context_checkpoint,
+                # Council: Multi-perspective deliberation
+                MessageType.COUNCIL_REQUEST: self._handle_council_request,
                 # Legacy: Task messages (still supported for compatibility)
                 MessageType.TASK_START: self._handle_task_start,
                 MessageType.TOOL_RESULT: self._handle_tool_result,
@@ -253,9 +276,25 @@ class ClientHandler:
 
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON from client: {e}")
+            # Bug fix 1.3: Notify client of JSON parse error
+            try:
+                await self._send_error(conn["websocket"], "", "invalid_json", str(e))
+            except Exception:
+                pass  # Best effort - client may have disconnected
         except Exception as e:
             import traceback
             logger.error(f"Error handling client message: {e}\n{traceback.format_exc()}")
+            # Bug fix 1.3: Notify client of internal error
+            try:
+                session_id = conn.get("session_id", "")
+                await self._send_error(
+                    conn["websocket"],
+                    session_id,
+                    "internal_error",
+                    f"Error processing message: {str(e)[:200]}"
+                )
+            except Exception:
+                pass  # Best effort - client may have disconnected
 
     async def _handle_session_start(
         self,
@@ -436,7 +475,7 @@ class ClientHandler:
             ).to_dict(),
             seq=seq,
         )
-        await websocket.send_text(json.dumps(resume_msg.to_dict()))
+        await self._safe_send(websocket, json.dumps(resume_msg.to_dict()), conn_id)
 
         logger.info(
             f"Session resumed: session={session_id}, "
@@ -477,7 +516,7 @@ class ClientHandler:
             payload={"ended": True},
             seq=seq,
         )
-        await websocket.send_text(json.dumps(end_msg.to_dict()))
+        await self._safe_send(websocket, json.dumps(end_msg.to_dict()), conn_id)
 
         logger.info(f"Session ended: session={session_id}")
 
@@ -506,7 +545,7 @@ class ClientHandler:
             seq=seq,
             ack=conn.get("client_ack", 0),
         )
-        await websocket.send_text(json.dumps(ack_msg.to_dict()))
+        await self._safe_send(websocket, json.dumps(ack_msg.to_dict()), conn_id)
 
     # =========================================================================
     # Model B: LLM Proxy Handlers
@@ -533,15 +572,80 @@ class ClientHandler:
             )
             return
 
+        # Bug fix 1.5: Block operations if resync is needed
+        if conn.get("needs_resync"):
+            await self._send_error(
+                conn["websocket"],
+                session_id,
+                "resync_required",
+                "Session state is stale. Please resync before continuing.",
+            )
+            return
+
+        # Check if LLM handler is available
+        if not self.llm_handler:
+            await self._send_error(
+                conn["websocket"],
+                session_id,
+                "llm_unavailable",
+                "LLM handler not available",
+            )
+            return
+
         user_id = conn["user_id"]
         websocket = conn["websocket"]
 
-        # Create send callback for streaming responses
+        # Bug fix 5.3: Create send callback with error handling for streaming responses
         async def send_callback(data: str) -> None:
-            await websocket.send_text(data)
+            await self._safe_send(websocket, data, conn_id)
 
         # Handle LLM request via LLM handler
         await self.llm_handler.handle_llm_request(
+            session_id=session_id,
+            user_id=user_id,
+            payload=msg.payload,
+            send_callback=send_callback,
+        )
+
+    async def _handle_council_request(
+        self,
+        conn_id: str,
+        msg: MessageEnvelope,
+    ) -> None:
+        """Handle council deliberation request from client."""
+        logger.info(f"Council request received: conn={conn_id}")
+        conn = self._connections.get(conn_id)
+        if not conn:
+            return
+
+        session_id = conn.get("session_id")
+        if not session_id:
+            await self._send_error(
+                conn["websocket"],
+                "",
+                "no_session",
+                "No active session",
+            )
+            return
+
+        if not self.council_handler:
+            await self._send_error(
+                conn["websocket"],
+                session_id,
+                "council_unavailable",
+                "Council handler not available",
+            )
+            return
+
+        user_id = conn["user_id"]
+        websocket = conn["websocket"]
+
+        # Bug fix 5.3: Create send callback with error handling
+        async def send_callback(data: str) -> None:
+            await self._safe_send(websocket, data, conn_id)
+
+        # Handle council request
+        await self.council_handler.handle_council_request(
             session_id=session_id,
             user_id=user_id,
             payload=msg.payload,
@@ -560,6 +664,16 @@ class ClientHandler:
 
         session_id = conn.get("session_id")
         if not session_id:
+            return
+
+        # Check if LLM handler is available
+        if not self.llm_handler:
+            await self._send_error(
+                conn["websocket"],
+                session_id,
+                "llm_unavailable",
+                "LLM handler not available",
+            )
             return
 
         await self.llm_handler.handle_llm_cancel(
@@ -581,11 +695,22 @@ class ClientHandler:
         if not session_id:
             return
 
+        # Check if LLM handler is available
+        if not self.llm_handler:
+            await self._send_error(
+                conn["websocket"],
+                session_id,
+                "llm_unavailable",
+                "LLM handler not available",
+            )
+            return
+
         user_id = conn["user_id"]
         websocket = conn["websocket"]
 
+        # Bug fix 5.3: Safe send callback
         async def send_callback(data: str) -> None:
-            await websocket.send_text(data)
+            await self._safe_send(websocket, data, conn_id)
 
         await self.llm_handler.handle_context_checkpoint(
             session_id=session_id,
@@ -593,6 +718,9 @@ class ClientHandler:
             payload=msg.payload,
             send_callback=send_callback,
         )
+
+        # Bug fix 1.5: Clear needs_resync after successful checkpoint
+        conn["needs_resync"] = False
 
     async def _handle_session_resume(
         self,
@@ -646,6 +774,9 @@ class ClientHandler:
             expected_context_ref != last_context_ref
         )
 
+        # Bug fix 1.5: Store needs_resync flag in connection state and block operations until resynced
+        conn["needs_resync"] = needs_resync
+
         # Update connection state
         conn["session_id"] = session_id
 
@@ -687,7 +818,7 @@ class ClientHandler:
             payload=sync_payload.to_dict(),
             seq=seq,
         )
-        await websocket.send_text(json.dumps(sync_msg.to_dict()))
+        await self._safe_send(websocket, json.dumps(sync_msg.to_dict()), conn_id)
 
         logger.info(
             f"Session resumed (Model B): session={session_id}, "
@@ -822,6 +953,37 @@ class ClientHandler:
         if task:
             task.cancel()
 
+    async def _safe_send(
+        self,
+        websocket: Any,
+        data: str,
+        conn_id: str = "",
+    ) -> bool:
+        """Bug fix 5.3: Safe websocket send with error handling.
+
+        Args:
+            websocket: The websocket connection
+            data: JSON string to send
+            conn_id: Connection ID for logging
+
+        Returns:
+            True if send succeeded, False otherwise
+        """
+        try:
+            await websocket.send_text(data)
+            return True
+        except Exception as e:
+            logger.warning(f"WebSocket send failed for {conn_id}: {e}")
+            # Mark connection as potentially stale
+            if conn_id and conn_id in self._connections:
+                conn = self._connections[conn_id]
+                conn["send_failures"] = conn.get("send_failures", 0) + 1
+                # If too many failures, schedule cleanup
+                if conn.get("send_failures", 0) >= 3:
+                    logger.error(f"Too many send failures for {conn_id}, closing connection")
+                    asyncio.create_task(self._cleanup_connection(conn_id))
+            return False
+
     async def _send_session_ready(
         self,
         websocket: Any,
@@ -847,7 +1009,7 @@ class ClientHandler:
             payload=payload.to_dict(),
             seq=1,
         )
-        await websocket.send_text(json.dumps(msg.to_dict()))
+        await self._safe_send(websocket, json.dumps(msg.to_dict()))
 
     async def _send_error(
         self,
@@ -858,4 +1020,4 @@ class ClientHandler:
     ) -> None:
         """Send error message to client."""
         msg = GatewayProtocol.create_error(session_id, error_code, message)
-        await websocket.send_text(json.dumps(msg.to_dict()))
+        await self._safe_send(websocket, json.dumps(msg.to_dict()))

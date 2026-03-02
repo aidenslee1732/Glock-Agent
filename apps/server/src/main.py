@@ -192,6 +192,28 @@ class MockRedisClient:
         return current + amount
 
 
+class MockPool:
+    """Mock asyncpg pool for dev mode."""
+
+    def __init__(self, parent: "MockPostgresClient"):
+        self._parent = parent
+
+    async def execute(self, query: str, *args) -> str:
+        """Mock execute - just return success."""
+        return "INSERT 0 1"
+
+    async def fetch(self, query: str, *args) -> list:
+        """Mock fetch - return empty list by default."""
+        return []
+
+    async def fetchrow(self, query: str, *args) -> Optional[dict]:
+        """Mock fetchrow - return None by default."""
+        # Handle checkpoint queries
+        if "context_checkpoints" in query.lower():
+            return None
+        return None
+
+
 class MockPostgresClient:
     """In-memory mock Postgres for dev mode."""
 
@@ -201,6 +223,8 @@ class MockPostgresClient:
         self._users = {}
         self._checkpoints = {}
         self._errors = {}
+        # Add mock pool for checkpoint store compatibility
+        self.pool = MockPool(self)
         logger.info("Using MockPostgresClient (DEV MODE)")
 
     async def connect(self):

@@ -4,6 +4,7 @@ import pytest
 import asyncio
 import tempfile
 import os
+import secrets
 from pathlib import Path
 
 
@@ -35,13 +36,17 @@ def add(a, b):
 
 @pytest.fixture
 def mock_env():
-    """Set up mock environment variables."""
+    """Set up mock environment variables.
+
+    Bug fix 1.7: Use randomly generated secrets instead of predictable hardcoded values.
+    """
     original = os.environ.copy()
 
+    # Generate unique random secrets for each test run
     os.environ.update({
-        "JWT_SECRET": "test-secret-key-at-least-32-characters",
+        "JWT_SECRET": secrets.token_hex(32),  # 64 char hex string
         "JWT_ISSUER": "glock.test",
-        "CONTEXT_MASTER_KEY": "0" * 64,
+        "CONTEXT_MASTER_KEY": secrets.token_hex(32),  # 64 char hex string
     })
 
     yield

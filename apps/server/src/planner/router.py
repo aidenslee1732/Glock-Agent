@@ -79,6 +79,24 @@ class TaskRouter:
             key = (m.task_type, m.complexity, m.strategy)
             self._metrics_index[key] = m
 
+    async def analyze(
+        self,
+        prompt: str,
+        workspace_context: Optional[dict[str, Any]] = None,
+        user_preferences: Optional[dict[str, Any]] = None,
+    ) -> TaskAnalysis:
+        """Analyze a task to determine its characteristics.
+
+        Args:
+            prompt: User's task description
+            workspace_context: Workspace context information
+            user_preferences: User's routing preferences
+
+        Returns:
+            TaskAnalysis with task type, complexity, and risk level
+        """
+        return self.analyzer.analyze(prompt, workspace_context or {})
+
     def route(
         self,
         prompt: str,

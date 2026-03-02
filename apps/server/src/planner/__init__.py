@@ -9,6 +9,22 @@ from .memory import MemoryManager, UserPreferences, MemoryConfig
 # Re-export CompiledPlan from shared protocol for convenience
 from packages.shared_protocol.types import CompiledPlan
 
+# Council system for multi-perspective deliberation
+from .council import (
+    CouncilOrchestrator,
+    CouncilResult,
+    CouncilConfig,
+    CouncilStrategy,
+    CouncilExecutor,
+    CouncilMiddleware,
+    create_standard_council,
+    create_security_focused_council,
+    create_fast_council,
+    create_thorough_council,
+    QualityGate,
+    QualityScore,
+)
+
 __all__ = [
     # Analyzer
     "TaskAnalyzer",
@@ -34,4 +50,17 @@ __all__ = [
     "MemoryManager",
     "UserPreferences",
     "MemoryConfig",
+    # Council
+    "CouncilOrchestrator",
+    "CouncilResult",
+    "CouncilConfig",
+    "CouncilStrategy",
+    "CouncilExecutor",
+    "CouncilMiddleware",
+    "create_standard_council",
+    "create_security_focused_council",
+    "create_fast_council",
+    "create_thorough_council",
+    "QualityGate",
+    "QualityScore",
 ]

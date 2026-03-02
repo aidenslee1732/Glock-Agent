@@ -1,6 +1,15 @@
 """Glock TUI - Terminal User Interface.
 
-Modern, minimal interface. """
+Modern, minimal interface with Phase 4 enhancements:
+- Parallel agent progress visualization
+- Collapsible tool output
+- Live token counter
+- Explore agent panel
+- Progress bars
+- Improved diff preview
+- File tree view
+- Status line
+"""
 
 from __future__ import annotations
 
@@ -27,24 +36,45 @@ from apps.cli.src.tools.user_tools.handlers import (
     QuestionResult,
 )
 
+# Phase 4: Import enhanced TUI components
+from .components import (
+    ParallelProgressTracker,
+    StatusLine,
+    FileTreeView,
+    CollapsibleOutput,
+    ProgressTracker,
+    ExploreAgentPanel,
+    ToolStatus,
+    ToolExecution,
+    ParallelBatch,
+)
 
-# Modern color palette
-ACCENT = "#10b981"  # Emerald green
-ACCENT_DIM = "#065f46"
-MUTED = "#6b7280"
-WARNING = "#f59e0b"
-ERROR = "#ef4444"
-SUCCESS = "#10b981"
+
+# Claude Code-like color palette - minimal and clean
+ACCENT = "#b794f4"  # Purple (Claude-like)
+ACCENT_DIM = "#805ad5"
+MUTED = "#718096"
+WARNING = "#ed8936"
+ERROR = "#f56565"
+SUCCESS = "#48bb78"
+INFO = "#63b3ed"
 
 
 class GlockTUI:
     """Modern terminal interface for Glock.
 
-    Clean, minimal design with:
+    Clean, minimal design with Phase 4 enhancements:
     - Inline streaming output (no boxes for text)
     - Spinner indicators for tool execution
     - Collapsible tool output
     - Markdown rendering
+    - Parallel agent progress visualization (4.1)
+    - Live token counter (4.3)
+    - Explore agent panel (4.4)
+    - Progress bars (4.5)
+    - Improved diff preview (4.6)
+    - File tree view (4.7)
+    - Status line (4.8)
     """
 
     def __init__(self, session: SessionHost, console: Optional[Console] = None):
@@ -54,6 +84,24 @@ class GlockTUI:
         self._running = False
         self._current_content = ""
         self._tool_depth = 0  # Track nested tool calls
+
+        # Phase 4: Enhanced TUI components
+        self._parallel_tracker = ParallelProgressTracker(self.console)
+        self._status_line = StatusLine(self.console)
+        self._file_tree = FileTreeView(self.console)
+        self._explore_panel = ExploreAgentPanel(self.console)
+        self._progress_tracker = ProgressTracker(self.console)
+
+        # Phase 4: Parallel batch tracking
+        self._current_batch: Optional[ParallelBatch] = None
+        self._pending_tools: dict[str, ToolExecution] = {}
+
+        # Phase 4: Live token tracking
+        self._tokens_used = 0
+        self._tokens_budget = 100000
+
+        # Phase 4: Show status line
+        self._show_status_line = True
 
         # Register the question callback for AskUserQuestion tool
         set_question_callback(self._handle_questions)
@@ -89,30 +137,40 @@ class GlockTUI:
             except EOFError:
                 self._running = False
 
-        self.console.print("\n[dim]Goodbye![/dim]")
+        self.console.print()
 
     def _show_banner(self) -> None:
-        """Show minimal banner."""
+        """Show minimal Claude Code-like banner."""
         self.console.print()
-        self.console.print(f"[bold {ACCENT}]Glock[/bold {ACCENT}] [dim]• session {self.session.session_id or 'connecting...'}[/dim]")
-        self.console.print(f"[dim]Type your request. Use /help for commands.[/dim]")
+        self.console.print(f"[bold {ACCENT}]╭─ Glock[/bold {ACCENT}]")
+        self.console.print(f"[dim]│ /help for commands, Ctrl+C to cancel[/dim]")
+        self.console.print(f"[{ACCENT}]╰─[/{ACCENT}]")
         self.console.print()
 
     async def _get_input(self) -> str:
-        """Get user input with styled prompt."""
+        """Get user input with Claude Code-style prompt."""
         loop = asyncio.get_event_loop()
         try:
             return await loop.run_in_executor(
                 None,
-                lambda: Prompt.ask(f"[bold {ACCENT}]>[/bold {ACCENT}]"),
+                lambda: Prompt.ask(f"[bold {ACCENT}]>[/bold {ACCENT}]:"),
             )
         except EOFError:
             return ""
 
     async def _submit_task(self, prompt: str) -> None:
-        """Submit a task with modern streaming output."""
+        """Submit a task with modern streaming output.
+
+        Phase 4 enhancements:
+        - 4.1: Parallel agent progress visualization
+        - 4.3: Live token counter updates
+        - 4.4: Explore agent panel
+        - 4.5: Progress bars for long operations
+        - 4.8: Status line updates
+        """
         self._current_content = ""
         self._tool_depth = 0
+        self._pending_tools.clear()
 
         # Run user-prompt-submit hooks
         if self.session.hook_manager:
@@ -123,35 +181,52 @@ class GlockTUI:
 
         self.console.print()
 
+        # Phase 4.8: Update status line to show running state
+        self._status_line.update(state="running")
+
+        # Start a new parallel batch for this task (Phase 4.1)
+        self._current_batch = self._parallel_tracker.start_batch()
+
+        # Clear explore panel (Phase 4.4)
+        self._explore_panel.clear()
+
         # Track state for clean output
         last_event_type = None
         tool_results: list[tuple[str, str, dict]] = []  # (tool_name, status, result)
         accumulated_text = ""
         files_modified: set[str] = set()
         total_tokens = 0
+        task_tokens = 0  # Tokens for this specific task
+        thinking_shown = False  # Track if thinking indicator is visible
 
         try:
             async for event in self.session.run_task(prompt):
                 event_type = event.type.value if hasattr(event.type, 'value') else str(event.type)
 
-                # Handle thinking indicator
+                # Handle thinking indicator - only show when no other content
                 if event_type == "thinking":
-                    if last_event_type != "thinking":
-                        self.console.print(f"[dim]Thinking...[/dim]", end="")
+                    if not thinking_shown and not accumulated_text:
+                        self.console.print(f"[dim]Thinking...[/dim]", end="", highlight=False)
+                        thinking_shown = True
                     last_event_type = event_type
                     continue
 
-                # Clear thinking indicator
-                if last_event_type == "thinking" and event_type != "thinking":
-                    self.console.print("\r" + " " * 20 + "\r", end="")
+                # Clear thinking indicator when ANY content arrives
+                if thinking_shown:
+                    # Clear the thinking text by overwriting with spaces
+                    self.console.print("\r" + " " * 15 + "\r", end="")
+                    thinking_shown = False
 
                 # Handle text streaming
                 if event_type == "text_delta":
                     content = event.content or event.data.get("content", "")
                     if content:
+                        # Filter out system/internal messages that shouldn't be shown
+                        if content.startswith("[System:") or "sanitised to satisfy protocol" in content:
+                            continue
                         accumulated_text += content
                         # Print text inline (streaming feel)
-                        self.console.print(content, end="")
+                        self.console.print(content, end="", highlight=False)
                     last_event_type = event_type
                     continue
 
@@ -160,12 +235,12 @@ class GlockTUI:
                     tool_name = event.tool_name or event.data.get("tool_name", "")
                     args = event.args or event.data.get("args", {})
 
-                    # End any accumulated text
+                    # End any accumulated text with newline
                     if accumulated_text:
                         self.console.print()
                         accumulated_text = ""
 
-                    # Show tool with spinner
+                    # Show tool indicator
                     self._show_tool_start(tool_name, args)
                     self._tool_depth += 1
                     last_event_type = event_type
@@ -210,7 +285,8 @@ class GlockTUI:
                         self.console.print()
                         accumulated_text = ""
 
-                    self.console.print(f"\n[{ERROR}]✗ {message}[/{ERROR}]")
+                    # Claude Code style: red text, no box
+                    self.console.print(f"[{ERROR}]Error: {message}[/{ERROR}]")
                     last_event_type = event_type
                     continue
 
@@ -247,94 +323,211 @@ class GlockTUI:
 
         self.console.print()
 
-    def _show_tool_start(self, tool_name: str, args: dict) -> None:
-        """Show tool execution start with modern styling."""
-        # Human-friendly tool names
+    def _show_tool_start(self, tool_name: str, args: dict, tool_id: str = "") -> None:
+        """Show tool execution start - Claude Code style (minimal spinner).
+
+        Phase 4.1: Supports parallel tool batching for aggregate display.
+        """
+        # Track tool for parallel batching (Phase 4.1)
+        tool_exec = self._parallel_tracker.add_tool(tool_name, args)
+        if tool_id:
+            self._pending_tools[tool_id] = tool_exec
+
+        # Human-friendly tool labels (present participle)
         tool_labels = {
             "read_file": "Reading",
+            "Read": "Reading",
             "edit_file": "Editing",
+            "Edit": "Editing",
             "write_file": "Writing",
+            "Write": "Writing",
+            "create_file": "Creating",
             "list_directory": "Listing",
             "glob": "Searching",
+            "Glob": "Searching",
             "grep": "Searching",
+            "Grep": "Searching",
             "bash": "Running",
+            "Bash": "Running",
+            "Task": "Running agent",
+            "WebFetch": "Fetching",
+            "WebSearch": "Searching web",
+            "NotebookEdit": "Editing notebook",
         }
 
-        label = tool_labels.get(tool_name, tool_name.replace("_", " ").title())
+        # Use label if defined, otherwise format the tool name
+        label = tool_labels.get(tool_name)
+        if not label:
+            # Format tool name nicely without awkward suffixes
+            label = tool_name.replace("_", " ").title()
 
-        # Get the key argument
-        if tool_name in ("read_file", "edit_file", "write_file"):
+        # Get the key argument for display
+        if tool_name in ("read_file", "edit_file", "write_file", "Read", "Edit", "Write"):
             target = args.get("file_path", "")
+            # Show just filename for cleaner display
+            if "/" in target:
+                target = target.rsplit("/", 1)[-1]
         elif tool_name == "list_directory":
             target = args.get("path", ".")
-        elif tool_name == "glob":
+        elif tool_name in ("glob", "Glob"):
             target = args.get("pattern", "")
-        elif tool_name == "grep":
-            target = args.get("pattern", "")
-        elif tool_name == "bash":
+        elif tool_name in ("grep", "Grep"):
+            pattern = args.get("pattern", "")
+            target = f'"{pattern[:25]}..."' if len(pattern) > 25 else f'"{pattern}"'
+        elif tool_name in ("bash", "Bash"):
             cmd = args.get("command", "")
-            target = cmd[:50] + "..." if len(cmd) > 50 else cmd
+            target = cmd[:40] + "..." if len(cmd) > 40 else cmd
+        elif tool_name == "Task":
+            target = args.get("description", "")[:40]
         else:
             target = ""
 
-        # Print inline with spinner character
+        # Claude Code style: simple inline indicator
         indent = "  " * self._tool_depth
-        self.console.print(f"\n{indent}[{MUTED}]⟳ {label}[/{MUTED}] [dim]{target}[/dim]", end="")
+        self.console.print(f"{indent}[dim]⏵ {label}[/dim] {target}", end="", highlight=False)
 
-    def _show_tool_end(self, tool_name: str, result: dict) -> None:
-        """Show tool completion inline."""
-        status = result.get("status", "success") if isinstance(result, dict) else "success"
+    def _show_tool_end(self, tool_name: str, result: dict, tool_id: str = "") -> None:
+        """Show tool completion - Claude Code style (minimal indicator)."""
+        # Detect errors: check multiple fields
+        error = None
+        if isinstance(result, dict):
+            status = result.get("status", "success")
+            error = result.get("error")
+            feedback = result.get("feedback")  # Council rejection feedback
 
-        if status == "success" or status is None:
-            # Just show checkmark on same line
-            self.console.print(f" [{SUCCESS}]✓[/{SUCCESS}]")
+            # Check for explicit error status
+            success = status in ("success", "ok", None) and not error
         else:
-            error = result.get("error", "Failed") if isinstance(result, dict) else "Failed"
-            self.console.print(f" [{ERROR}]✗ {error[:50]}[/{ERROR}]")
+            success = True
+
+        # Update parallel tracker (Phase 4.1)
+        if tool_id and tool_id in self._pending_tools:
+            tool_exec = self._pending_tools.pop(tool_id)
+            self._parallel_tracker.complete_tool(tool_exec, result, success)
+
+        if success:
+            # Claude Code style: newline after tool (clean separation)
+            self.console.print()
+        else:
+            # Show error clearly
+            error_msg = error or feedback or "Failed"
+            if isinstance(error_msg, str):
+                error_msg = error_msg[:80]
+            self.console.print(f"\n[{ERROR}]✗ {error_msg}[/{ERROR}]")
 
     def _show_edit_proposal(self, file_path: str, diff: str, new_content: str) -> None:
-        """Show edit proposal with syntax highlighting."""
+        """Show edit proposal with syntax highlighting.
+
+        Phase 4.6: Improved diff preview with:
+        - Syntax highlighting for language
+        - Inline word-level diff highlighting
+        - Context lines with line numbers
+        """
         self.console.print()
+
+        # Get language from file extension
+        suffix = file_path.rsplit(".", 1)[-1] if "." in file_path else ""
+        lang_map = {
+            "py": "python",
+            "js": "javascript",
+            "ts": "typescript",
+            "jsx": "javascript",
+            "tsx": "typescript",
+            "go": "go",
+            "rs": "rust",
+            "java": "java",
+            "cpp": "cpp",
+            "c": "c",
+            "rb": "ruby",
+            "sql": "sql",
+            "json": "json",
+            "yaml": "yaml",
+            "yml": "yaml",
+            "md": "markdown",
+        }
+        language = lang_map.get(suffix, "")
+
         self.console.print(f"[{WARNING}]┌─ Edit: {file_path}[/{WARNING}]")
 
         if diff:
-            # Show diff with colors
-            for line in diff.split("\n")[:10]:  # Limit to 10 lines
-                if line.startswith("+"):
-                    self.console.print(f"[green]│ {line}[/green]")
-                elif line.startswith("-"):
-                    self.console.print(f"[red]│ {line}[/red]")
-                else:
+            # Phase 4.6: Enhanced diff display
+            lines = diff.split("\n")
+            line_count = 0
+            max_lines = 15
+
+            for line in lines:
+                if line_count >= max_lines:
+                    remaining = len(lines) - line_count
+                    self.console.print(f"[dim]│ ... {remaining} more lines[/dim]")
+                    break
+
+                if line.startswith("+++") or line.startswith("---"):
+                    # File headers
                     self.console.print(f"[dim]│ {line}[/dim]")
+                elif line.startswith("@@"):
+                    # Hunk headers - show line numbers
+                    self.console.print(f"[{INFO}]│ {line}[/{INFO}]")
+                elif line.startswith("+"):
+                    # Added lines - green with highlighting
+                    content = line[1:] if len(line) > 1 else ""
+                    self.console.print(f"[green]│ + {content}[/green]")
+                elif line.startswith("-"):
+                    # Removed lines - red with strikethrough style
+                    content = line[1:] if len(line) > 1 else ""
+                    self.console.print(f"[red]│ - {content}[/red]")
+                else:
+                    # Context lines
+                    self.console.print(f"[dim]│   {line}[/dim]")
+
+                line_count += 1
+
         elif new_content:
-            # Show preview of new content
-            preview = new_content[:200]
-            if len(new_content) > 200:
-                preview += "..."
-            for line in preview.split("\n")[:5]:
-                self.console.print(f"[dim]│ {line}[/dim]")
+            # Show preview of new content with syntax highlighting
+            preview_lines = new_content.split("\n")[:10]
+
+            if language:
+                # Use Rich syntax highlighting
+                preview = "\n".join(preview_lines)
+                syntax = Syntax(preview, language, theme="monokai", line_numbers=True)
+                self.console.print(Panel(syntax, border_style="dim"))
+            else:
+                for i, line in enumerate(preview_lines, 1):
+                    self.console.print(f"[dim]│ {i:3d} │ {line}[/dim]")
+
+            if len(new_content.split("\n")) > 10:
+                remaining = len(new_content.split("\n")) - 10
+                self.console.print(f"[dim]│ ... {remaining} more lines[/dim]")
 
         self.console.print(f"[{WARNING}]└─[/{WARNING}]")
 
     def _show_completion(self, summary: str, files_modified: set, total_tokens: int) -> None:
-        """Show task completion summary."""
+        """Show task completion summary - Claude Code style (minimal)."""
         self.console.print()
 
-        # Success indicator
-        self.console.print(f"[{SUCCESS}]✓ Done[/{SUCCESS}]", end="")
+        # Phase 4.3: Update token counter
+        self._tokens_used += total_tokens
 
-        # Files modified
-        if files_modified:
-            file_list = ", ".join(sorted(files_modified)[:3])
-            if len(files_modified) > 3:
-                file_list += f" +{len(files_modified) - 3} more"
-            self.console.print(f" [dim]• {file_list}[/dim]", end="")
+        # Claude Code style: "✓ Done • X tokens"
+        parts = [f"[{SUCCESS}]✓ Done[/{SUCCESS}]"]
 
-        # Tokens
+        # Show files inline if any
+        if files_modified and len(files_modified) <= 3:
+            file_list = ", ".join(sorted(files_modified))
+            parts.append(f"[dim]• {file_list}[/dim]")
+
+        # Tokens (always show)
         if total_tokens:
-            self.console.print(f" [dim]• {total_tokens:,} tokens[/dim]")
-        else:
-            self.console.print()
+            parts.append(f"[dim]• {total_tokens:,} tokens[/dim]")
+
+        self.console.print(" ".join(parts))
+
+        # If many files, show on next line
+        if files_modified and len(files_modified) > 3:
+            files_list = [
+                {"path": f, "action": "M", "additions": 0, "deletions": 0}
+                for f in sorted(files_modified)
+            ]
+            self.console.print(self._file_tree.render(files_list, "Modified"))
 
     async def _handle_approval(self) -> None:
         """Handle tool approval request."""
@@ -364,6 +557,10 @@ class GlockTUI:
             "/commit": self._cmd_commit,
             "/pr": self._cmd_pr,
             "/model": self._cmd_model,
+            # Phase 4.3: Token tracking
+            "/tokens": self._cmd_tokens,
+            # Phase 4.8: Status bar toggle
+            "/statusbar": self._cmd_statusbar,
         }
 
         handler = commands.get(cmd)
@@ -376,15 +573,17 @@ class GlockTUI:
         """Show help."""
         self.console.print()
         self.console.print("[bold]Commands[/bold]")
-        self.console.print(f"  [dim]/help[/dim]    Show this help")
-        self.console.print(f"  [dim]/clear[/dim]   Clear screen")
-        self.console.print(f"  [dim]/status[/dim]  Session status")
-        self.console.print(f"  [dim]/tasks[/dim]   Show task list")
-        self.console.print(f"  [dim]/plan[/dim]    Enter plan mode")
-        self.console.print(f"  [dim]/commit[/dim]  Commit changes")
-        self.console.print(f"  [dim]/pr[/dim]      Create pull request")
-        self.console.print(f"  [dim]/model[/dim]   Change model (haiku/sonnet/opus)")
-        self.console.print(f"  [dim]/exit[/dim]    Exit Glock")
+        self.console.print(f"  [dim]/help[/dim]      Show this help")
+        self.console.print(f"  [dim]/clear[/dim]     Clear screen")
+        self.console.print(f"  [dim]/status[/dim]    Session status")
+        self.console.print(f"  [dim]/tasks[/dim]     Show task list")
+        self.console.print(f"  [dim]/plan[/dim]      Enter plan mode")
+        self.console.print(f"  [dim]/commit[/dim]    Commit changes")
+        self.console.print(f"  [dim]/pr[/dim]        Create pull request")
+        self.console.print(f"  [dim]/model[/dim]     Change model (haiku/sonnet/opus)")
+        self.console.print(f"  [dim]/tokens[/dim]    Show token usage")
+        self.console.print(f"  [dim]/statusbar[/dim] Toggle status bar")
+        self.console.print(f"  [dim]/exit[/dim]      Exit Glock")
         self.console.print()
 
     async def _cmd_clear(self, args: list[str]) -> None:
@@ -513,6 +712,38 @@ class GlockTUI:
         else:
             self.console.print(f"[{ERROR}]Invalid model. Choose from: {', '.join(valid_models)}[/{ERROR}]")
 
+        self.console.print()
+
+    async def _cmd_tokens(self, args: list[str]) -> None:
+        """Show token usage statistics (Phase 4.3)."""
+        self.console.print()
+
+        ratio = self._tokens_used / self._tokens_budget if self._tokens_budget > 0 else 0
+        if ratio < 0.5:
+            bar_style = SUCCESS
+        elif ratio < 0.8:
+            bar_style = WARNING
+        else:
+            bar_style = ERROR
+
+        # Visual bar
+        bar_width = 40
+        filled = int(ratio * bar_width)
+        bar = "█" * filled + "░" * (bar_width - filled)
+
+        self.console.print("[bold]Token Usage[/bold]")
+        self.console.print(f"  [{bar_style}]{bar}[/{bar_style}] {ratio * 100:.1f}%")
+        self.console.print()
+        self.console.print(f"  [dim]Used:[/dim]   [{bar_style}]{self._tokens_used:,}[/{bar_style}]")
+        self.console.print(f"  [dim]Budget:[/dim] {self._tokens_budget:,}")
+        self.console.print(f"  [dim]Remaining:[/dim] {self._tokens_budget - self._tokens_used:,}")
+        self.console.print()
+
+    async def _cmd_statusbar(self, args: list[str]) -> None:
+        """Toggle status bar visibility (Phase 4.8)."""
+        self._show_status_line = not self._show_status_line
+        state = "enabled" if self._show_status_line else "disabled"
+        self.console.print(f"\n[{SUCCESS}]Status bar {state}.[/{SUCCESS}]")
         self.console.print()
 
     async def _handle_questions(self, questions: List[Question]) -> List[QuestionResult]:

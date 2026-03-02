@@ -42,6 +42,8 @@ from apps.server.src.planner.llm.gateway import (
     ToolDefinition as LLMToolDefinition,
     LLMError,
 )
+# Bug fix 1.8: Import configurable system prompt
+from apps.server.src.config.system_prompt import load_system_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +90,8 @@ class LLMHandler:
 
         self._active_requests: dict[str, ActiveRequest] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
+        # Bug fix 1.4: Add lock for thread-safe access to request tracking dicts
+        self._request_lock = asyncio.Lock()
 
     async def handle_llm_request(
         self,
@@ -105,8 +109,10 @@ class LLMHandler:
             user_id=user_id,
             started_at=time.time(),
         )
-        self._active_requests[request_id] = active_request
-        self._cancel_events[request_id] = asyncio.Event()
+        # Bug fix 1.4: Use lock for thread-safe access
+        async with self._request_lock:
+            self._active_requests[request_id] = active_request
+            self._cancel_events[request_id] = asyncio.Event()
 
         try:
             context_ref = payload.get("context_ref")
@@ -148,7 +154,11 @@ class LLMHandler:
                 user_id=user_id,
                 session_id=session_id,
             ):
-                if self._cancel_events[request_id].is_set():
+                # Bug fix 1.2: Check cancel event with lock protection
+                async with self._request_lock:
+                    cancel_event = self._cancel_events.get(request_id)
+                    is_cancelled = cancel_event and cancel_event.is_set()
+                if is_cancelled:
                     finish_reason = "cancelled"
                     break
 
@@ -168,8 +178,15 @@ class LLMHandler:
                     if current_tool_id and current_tool_name:
                         try:
                             args = json.loads(current_tool_args) if current_tool_args else {}
-                        except json.JSONDecodeError:
-                            args = {}
+                        except json.JSONDecodeError as e:
+                            # Bug fix 2.2: Log error and mark tool call as invalid instead of creating garbage args
+                            logger.error(f"Failed to parse tool args for {current_tool_name}: {e}, raw={current_tool_args[:100]}")
+                            # Create an error result that the client can handle appropriately
+                            args = {
+                                "__parse_error__": True,
+                                "__error_message__": f"Invalid JSON arguments: {str(e)}",
+                                "__raw_args_preview__": current_tool_args[:200] if current_tool_args else "",
+                            }
                         tool_calls.append(ToolCallResult(
                             tool_call_id=current_tool_id,
                             tool_name=current_tool_name,
@@ -190,8 +207,14 @@ class LLMHandler:
             if current_tool_id and current_tool_name:
                 try:
                     args = json.loads(current_tool_args) if current_tool_args else {}
-                except json.JSONDecodeError:
-                    args = {}
+                except json.JSONDecodeError as e:
+                    # Bug fix 2.2: Log error and mark tool call as invalid
+                    logger.error(f"Failed to parse tool args for {current_tool_name}: {e}, raw={current_tool_args[:100]}")
+                    args = {
+                        "__parse_error__": True,
+                        "__error_message__": f"Invalid JSON arguments: {str(e)}",
+                        "__raw_args_preview__": current_tool_args[:200] if current_tool_args else "",
+                    }
                 tool_calls.append(ToolCallResult(
                     tool_call_id=current_tool_id,
                     tool_name=current_tool_name,
@@ -257,8 +280,10 @@ class LLMHandler:
             )
 
         finally:
-            self._active_requests.pop(request_id, None)
-            self._cancel_events.pop(request_id, None)
+            # Bug fix 1.4: Use lock for thread-safe cleanup
+            async with self._request_lock:
+                self._active_requests.pop(request_id, None)
+                self._cancel_events.pop(request_id, None)
 
     async def handle_llm_cancel(
         self,
@@ -270,9 +295,12 @@ class LLMHandler:
         if not request_id:
             return
 
-        if request_id in self._cancel_events:
-            self._cancel_events[request_id].set()
-            logger.info(f"Cancelled LLM request: {request_id}")
+        # Bug fix 1.2: Access cancel events with lock protection
+        async with self._request_lock:
+            cancel_event = self._cancel_events.get(request_id)
+            if cancel_event:
+                cancel_event.set()
+                logger.info(f"Cancelled LLM request: {request_id}")
 
     async def handle_context_checkpoint(
         self,
@@ -349,27 +377,44 @@ class LLMHandler:
 
         except Exception as e:
             logger.exception(f"Failed to store checkpoint {checkpoint_id}")
-            # Store error in database and raise user-friendly error
-            from apps.server.src.errors import handle_error, ErrorContext, GlockError
+
+            # Bug fix 2.3: Send explicit error to client instead of just raising
+            error_payload = {
+                "checkpoint_id": checkpoint_id,
+                "error_code": "checkpoint_storage_failed",
+                "error_message": f"Failed to store checkpoint: {str(e)[:200]}",
+                "retryable": True,
+            }
+
+            error_msg = MessageEnvelope.create(
+                msg_type=MessageType.SESSION_ERROR,
+                session_id=session_id,
+                payload=error_payload,
+            )
+
             try:
-                import asyncio
-                asyncio.create_task(handle_error(
-                    e,
-                    component="llm_handler.checkpoint",
-                    context=ErrorContext(
-                        session_id=session_id,
-                        user_id=user_id,
-                        additional={"checkpoint_id": checkpoint_id},
-                    ),
-                    reraise=False,
-                ))
-            except Exception:
-                pass  # Don't fail if error storage fails
+                await send_callback(json.dumps(error_msg.to_dict()))
+            except Exception as send_err:
+                logger.error(f"Failed to send checkpoint error to client: {send_err}")
+
+            # Log the error synchronously to ensure it's captured
+            logger.error(
+                f"Checkpoint storage failed: checkpoint_id={checkpoint_id}, "
+                f"session_id={session_id}, error={e}"
+            )
+
+            # Still raise for upstream handling but client is now notified
+            from apps.server.src.errors import GlockError, ErrorContext
+            error_context = ErrorContext(
+                session_id=session_id,
+                user_id=user_id,
+                additional={"checkpoint_id": checkpoint_id},
+            )
             raise GlockError(
                 f"Failed to store checkpoint {checkpoint_id}: {e}",
                 original_error=e,
                 severity="critical",
-                context=ErrorContext(session_id=session_id, user_id=user_id),
+                context=error_context,
             ) from e
 
     async def _build_messages(
@@ -466,12 +511,25 @@ class LLMHandler:
                 tool_call_id = result.get("tool_call_id", "")
                 tool_name = result.get("tool_name", "unknown_tool")
 
+                # Bug fix 1.3: Preserve original arguments if available in tool_results_compressed
+                original_args = result.get("arguments", result.get("args", {}))
+                if isinstance(original_args, dict):
+                    args_str = json.dumps(original_args)
+                elif isinstance(original_args, str):
+                    args_str = original_args
+                else:
+                    args_str = "{}"
+                    logger.warning(
+                        f"No original arguments found for unmatched tool result: "
+                        f"tool_call_id={tool_call_id}, tool_name={tool_name}"
+                    )
+
                 reconstructed_tool_calls.append(ToolCallMessage(
                     id=tool_call_id,
                     type="function",
                     function=FunctionCall(
                         name=tool_name,
-                        arguments="{}",  # We don't have the original arguments
+                        arguments=args_str,
                     ),
                 ))
 
@@ -552,48 +610,24 @@ class LLMHandler:
         return json.dumps(tool_content_data, indent=2)
 
     def _build_system_prompt(self, context_pack: dict[str, Any]) -> str:
-        """Build system prompt from context pack."""
+        """Build system prompt from context pack.
+
+        Bug fix 1.8: System prompt is now configurable via environment variables
+        or configuration files instead of being hardcoded.
+        """
         parts: list[str] = []
 
-        # Base system instructions with default stack
-        base_prompt = """You are Glock, an AI coding assistant. You help users build software projects.
-
-## Default Technology Stack
-
-When creating new projects, use these defaults unless the user specifies otherwise:
-
-- **Frontend**: Next.js 14+ with TypeScript, Tailwind CSS, and shadcn/ui
-- **Backend**: FastAPI with Python 3.11+
-- **Fullstack**: Both of the above with CORS pre-configured
-
-Always use the default stack for new projects. Only deviate if the user explicitly requests a different technology.
-
-## Project Creation Guidelines
-
-When creating new projects, ALWAYS use proper CLI tools:
-
-### Frontend (Next.js)
-```bash
-npx create-next-app@latest <project-name> --typescript --tailwind --eslint --app --src-dir --import-alias "@/*" --use-npm
-```
-Then add shadcn/ui:
-```bash
-cd <project-name> && npx shadcn@latest init -y && npx shadcn@latest add button input card
-```
-
-### Backend (FastAPI)
-Create the directory and write main.py with FastAPI app including CORS middleware for localhost:3000.
-
-## Code Guidelines
-
-- Write clean, production-ready code
-- Follow best practices for each technology
-- Include proper error handling
-- Add helpful comments where needed
-- Create complete, working implementations
-- ALWAYS wait for CLI commands to complete before proceeding"""
+        # Load system prompt from configuration (env var, file, or default)
+        system_prompt_config = load_system_prompt()
+        base_prompt = system_prompt_config.prompt
+        logger.debug(f"Using system prompt from {system_prompt_config.source}")
 
         parts.append(base_prompt)
+
+        # Include project config if provided
+        project_config = context_pack.get("project_config", "")
+        if project_config:
+            parts.append(project_config)
 
         summary = context_pack.get("rolling_summary", {})
         if summary:
@@ -669,8 +703,26 @@ Create the directory and write main.py with FastAPI app including CORS middlewar
             # Process each checkpoint in the chain
             for checkpoint in chain:
                 try:
+                    # Bug fix 2.4: Add null check for checkpoint payload
+                    if checkpoint.payload is None:
+                        logger.warning(f"Checkpoint {checkpoint.id} has null payload, skipping")
+                        continue
+
+                    # Ensure payload is bytes-like before decoding
+                    if isinstance(checkpoint.payload, str):
+                        payload_str = checkpoint.payload
+                    elif isinstance(checkpoint.payload, bytes):
+                        try:
+                            payload_str = checkpoint.payload.decode("utf-8")
+                        except UnicodeDecodeError as e:
+                            logger.error(f"Failed to decode checkpoint {checkpoint.id}: {e}")
+                            continue
+                    else:
+                        logger.warning(f"Unexpected payload type for checkpoint {checkpoint.id}: {type(checkpoint.payload)}")
+                        continue
+
                     # Parse the decrypted payload as JSON
-                    payload_data = json.loads(checkpoint.payload.decode("utf-8"))
+                    payload_data = json.loads(payload_str)
 
                     # Extract messages from the payload
                     checkpoint_messages = payload_data.get("messages", [])

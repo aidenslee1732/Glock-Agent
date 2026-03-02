@@ -9,6 +9,7 @@ Manages up to 30 important facts that persist across context compaction:
 - Project constraints
 
 Uses LRU eviction weighted by importance and use_count.
+Integrates with MemoryStore for persistent storage.
 """
 
 from __future__ import annotations
@@ -17,9 +18,12 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Optional, TYPE_CHECKING
 
 from packages.shared_protocol.types import PinnedFact
+
+if TYPE_CHECKING:
+    from ..memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -58,11 +62,20 @@ class PinnedFactsManager:
     - Higher importance = stays longer
     - More frequent use = stays longer
     - Recency also matters
+
+    Optionally integrates with MemoryStore for persistent storage.
     """
 
-    def __init__(self, config: Optional[FactsConfig] = None):
+    def __init__(
+        self,
+        config: Optional[FactsConfig] = None,
+        memory_store: Optional["MemoryStore"] = None,
+        workspace: Optional[str] = None,
+    ):
         self.config = config or FactsConfig()
         self._facts: dict[str, PinnedFact] = {}
+        self._memory_store = memory_store
+        self._workspace = workspace
 
     @property
     def facts(self) -> list[PinnedFact]:
@@ -79,6 +92,7 @@ class PinnedFactsManager:
         value: str,
         category: str = "default",
         importance: Optional[float] = None,
+        persist: bool = True,
     ) -> None:
         """
         Add or update a fact.
@@ -88,6 +102,7 @@ class PinnedFactsManager:
             value: Fact value (e.g., "src/config.py")
             category: Category for importance weighting
             importance: Override importance (uses category default if None)
+            persist: If True and memory_store is available, persist to disk
         """
         # Truncate key and value
         key = key[:self.config.max_key_length]
@@ -116,6 +131,19 @@ class PinnedFactsManager:
                 created_at=datetime.utcnow(),
                 last_used_at=datetime.utcnow(),
             )
+
+        # Persist to memory store if available
+        if persist and self._memory_store is not None:
+            try:
+                self._memory_store.add(
+                    key=key,
+                    value=value,
+                    category=category,
+                    workspace=self._workspace,
+                    importance=importance,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to persist fact to memory store: {e}")
 
         # Evict if over limit
         self._evict_if_needed()
@@ -290,3 +318,103 @@ class PinnedFactsManager:
     def reset(self) -> None:
         """Clear all facts."""
         self._facts.clear()
+
+    def set_memory_store(self, memory_store: "MemoryStore", workspace: Optional[str] = None) -> None:
+        """Set the memory store for persistence.
+
+        Args:
+            memory_store: MemoryStore instance
+            workspace: Workspace path for scoping
+        """
+        self._memory_store = memory_store
+        self._workspace = workspace
+
+    def load_from_memory_store(self, limit: int = 30) -> int:
+        """Load facts from memory store.
+
+        Args:
+            limit: Maximum facts to load
+
+        Returns:
+            Number of facts loaded
+        """
+        if self._memory_store is None:
+            return 0
+
+        try:
+            # Get relevant memories from store
+            memories = self._memory_store.get_all_for_context(
+                workspace=self._workspace,
+                max_tokens=self.config.max_facts * 50,  # Rough estimate
+            )
+
+            if not memories:
+                return 0
+
+            # Parse the formatted text and add facts
+            loaded = 0
+            for line in memories.split("\n"):
+                if line.strip().startswith("- "):
+                    # Parse "- key: value" format
+                    content = line.strip()[2:]  # Remove "- "
+                    if ": " in content:
+                        key, value = content.split(": ", 1)
+                        self.add_fact(key.strip(), value.strip(), persist=False)
+                        loaded += 1
+                        if loaded >= limit:
+                            break
+
+            logger.debug(f"Loaded {loaded} facts from memory store")
+            return loaded
+
+        except Exception as e:
+            logger.warning(f"Failed to load facts from memory store: {e}")
+            return 0
+
+    def extract_and_persist(
+        self,
+        content: str,
+        role: str = "assistant",
+        source: Optional[str] = None,
+    ) -> list[PinnedFact]:
+        """Extract facts from content and persist to memory store.
+
+        Args:
+            content: Content to extract facts from
+            role: Message role ("user" or "assistant")
+            source: Optional source identifier
+
+        Returns:
+            List of extracted facts
+        """
+        # Extract facts using existing method
+        self.extract_from_content(content, role)
+
+        # Return the current facts list
+        return self.facts
+
+    def sync_to_memory_store(self) -> int:
+        """Sync all current facts to memory store.
+
+        Returns:
+            Number of facts synced
+        """
+        if self._memory_store is None:
+            return 0
+
+        synced = 0
+        for fact in self._facts.values():
+            try:
+                self._memory_store.add(
+                    key=fact.key,
+                    value=fact.value,
+                    category=fact.category,
+                    workspace=self._workspace,
+                    importance=fact.importance,
+                )
+                synced += 1
+            except Exception as e:
+                logger.warning(f"Failed to sync fact {fact.key}: {e}")
+
+        logger.debug(f"Synced {synced} facts to memory store")
+        return synced

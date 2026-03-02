@@ -9,6 +9,7 @@ from typing import Optional
 
 from .base import Skill
 from .registry import SkillRegistry
+from .composer import register_composite_skills
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ class SkillLoader:
         Returns:
             Number of skills loaded
         """
-        from .builtin import commit, review_pr, create_pr, remember
+        from .builtin import commit, review_pr, create_pr, remember, review, security_scan
 
         loaded = 0
 
@@ -54,8 +55,26 @@ class SkillLoader:
             self.registry.register(remember.get_skill())
             loaded += 1
 
+        # Review skill
+        if hasattr(review, 'get_skill'):
+            self.registry.register(review.get_skill())
+            loaded += 1
+
+        # Security scan skill
+        if hasattr(security_scan, 'get_skill'):
+            self.registry.register(security_scan.get_skill())
+            loaded += 1
+
         logger.info(f"Loaded {loaded} built-in skills")
         return loaded
+
+    def load_composite_skills(self) -> int:
+        """Load composite skills that chain other skills.
+
+        Returns:
+            Number of composite skills loaded
+        """
+        return register_composite_skills(self.registry)
 
     def load_custom_skills(self, skills_dir: Path) -> int:
         """Load custom skills from a directory.

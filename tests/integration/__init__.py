@@ -1,1 +1,1 @@
-"""Integration tests for Glock Model B."""
+"""Integration tests for Glock server."""

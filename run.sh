@@ -168,7 +168,7 @@ start_dev_mode() {
     export JWT_SECRET="${JWT_SECRET:-dev-mode-secret-key-at-least-32-chars}"
     export JWT_ISSUER="${JWT_ISSUER:-glock.dev}"
     export CONTEXT_MASTER_KEY="${CONTEXT_MASTER_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}"
-    export LOG_LEVEL="${LOG_LEVEL:-debug}"
+    export LOG_LEVEL="${LOG_LEVEL:-error}"
 
     if [ -z "$ANTHROPIC_API_KEY" ]; then
         echo -e "${YELLOW}Warning: ANTHROPIC_API_KEY not set${NC}"
@@ -216,7 +216,7 @@ start_server() {
     export JWT_SECRET="${JWT_SECRET:-local-dev-secret-key-at-least-32-chars}"
     export JWT_ISSUER="${JWT_ISSUER:-glock.dev}"
     export CONTEXT_MASTER_KEY="${CONTEXT_MASTER_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}"
-    export LOG_LEVEL="${LOG_LEVEL:-debug}"
+    export LOG_LEVEL="${LOG_LEVEL:-error}"
 
     if [ -z "$ANTHROPIC_API_KEY" ]; then
         echo -e "${YELLOW}Warning: ANTHROPIC_API_KEY not set${NC}"

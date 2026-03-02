@@ -227,6 +227,17 @@ class TokenBudgetManager:
         return summary
 
     def estimate_tokens(self, text: str) -> int:
-        """Estimate token count for text."""
-        # Rough estimate: ~4 characters per token
-        return len(text) // 4 + 1
+        """Estimate token count for text.
+
+        Uses accurate tokenization when available (tiktoken),
+        falls back to improved heuristics.
+        """
+        try:
+            from .tokenizer import count_tokens
+            return count_tokens(text)
+        except ImportError:
+            # Fallback to improved heuristic (better than len // 4)
+            if not text:
+                return 0
+            # ~3.7 chars per token for mixed content
+            return max(1, int(len(text) / 3.7))

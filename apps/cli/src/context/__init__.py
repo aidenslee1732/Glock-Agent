@@ -1,4 +1,7 @@
-"""Context management for Model B client."""
+"""Context management for Model B client.
+
+v4: Added accurate tokenization support.
+"""
 
 from .packer import ContextPacker
 from .budget import TokenBudgetManager
@@ -7,6 +10,12 @@ from .slicer import SelectiveFileSlicer
 from .summary import RollingSummaryManager
 from .facts import PinnedFactsManager
 from .delta import DeltaBuilder
+from .tokenizer import (
+    AccurateTokenizer,
+    get_tokenizer,
+    count_tokens,
+    estimate_tokens,
+)
 
 __all__ = [
     "ContextPacker",
@@ -16,4 +25,9 @@ __all__ = [
     "RollingSummaryManager",
     "PinnedFactsManager",
     "DeltaBuilder",
+    # v4: Tokenization
+    "AccurateTokenizer",
+    "get_tokenizer",
+    "count_tokens",
+    "estimate_tokens",
 ]

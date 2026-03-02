@@ -90,6 +90,49 @@ from .mcp_tools import (
     init_mcp_tools,
 )
 
+# Phase 3: Code formatting tools
+from .formatter import (
+    format_file_handler,
+    format_directory_handler,
+    detect_formatters_handler,
+)
+
+# Phase 3: Profiler tools
+from .profiler import (
+    profile_python_handler,
+    profile_node_handler,
+    profile_analyze_handler,
+)
+
+# Phase 3: Database tools
+from .database import (
+    db_connect_handler,
+    db_query_handler,
+    db_schema_handler,
+    db_close_handler,
+)
+
+# Phase 3: Debugger tools
+from ..debugger import (
+    debug_start_handler,
+    debug_breakpoint_handler,
+    debug_continue_handler,
+    debug_stack_handler,
+    debug_evaluate_handler,
+    debug_stop_handler,
+)
+
+# Phase 3: Dependency scanning tools
+from ..security.dependency_scanner import scan_dependencies_handler
+
+# Phase 3: CI/CD tools
+from ..cicd import (
+    ci_status_handler,
+    ci_test_results_handler,
+    ci_generate_workflow_handler,
+    ci_trigger_handler,
+)
+
 if TYPE_CHECKING:
     from ..tasks import TaskManager, BackgroundTaskRunner
     from ..agents import AgentRegistry, AgentRunner
@@ -97,6 +140,8 @@ if TYPE_CHECKING:
     from ..planning import PlanMode
     from ..hooks import HookManager
     from ..mcp import MCPToolProxy
+    from ..capsule.manager import CapsuleManager
+    from ..capsule.policy import SandboxPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +160,14 @@ class ToolResult:
     duration_ms: int = 0
     truncated: bool = False
     error: Optional[str] = None
+
+
+@dataclass
+class CacheEntry:
+    """Cache entry for tool results."""
+    result: ToolResult
+    timestamp: float
+    hits: int = 0
 
 
 class ToolBroker:
@@ -157,11 +210,45 @@ class ToolBroker:
         plan_mode: Optional["PlanMode"] = None,
         mcp_proxy: Optional["MCPToolProxy"] = None,
         hook_manager: Optional["HookManager"] = None,
+        capsule_manager: Optional["CapsuleManager"] = None,
+        session_id: Optional[str] = None,
+        enable_sandbox: bool = False,
     ):
         self.workspace_dir = Path(workspace_dir).resolve()
         logger.info(f"ToolBroker initialized with workspace: {self.workspace_dir}")
         self._hook_manager: Optional["HookManager"] = hook_manager
         self._plan_mode: Optional["PlanMode"] = plan_mode
+        self._capsule_manager: Optional["CapsuleManager"] = capsule_manager
+        self._session_id = session_id
+        self._enable_sandbox = enable_sandbox
+
+        # v4 enhancement: Tool result cache
+        self._cache: Dict[str, CacheEntry] = {}
+        self._cache_ttl: float = 60.0  # Cache TTL in seconds
+        self._cache_enabled: bool = True
+        self._cacheable_tools: set[str] = {
+            "read_file", "Read",
+            "glob", "Glob",
+            "grep", "Grep",
+            "list_directory",
+        }
+        self._cache_hits: int = 0
+        self._cache_misses: int = 0
+
+        # Initialize capsule manager if sandbox is enabled but no manager provided
+        if enable_sandbox and capsule_manager is None and session_id:
+            try:
+                from ..capsule.manager import CapsuleManager
+                from ..capsule.policy import SandboxPolicy
+                self._capsule_manager = CapsuleManager(
+                    session_id=session_id,
+                    workspace_path=str(self.workspace_dir),
+                    policy=SandboxPolicy.standard(),
+                )
+                logger.info("CapsuleManager initialized for sandboxed execution")
+            except ImportError:
+                logger.warning("Capsule module not available, sandbox disabled")
+                self._enable_sandbox = False
 
         # Initialize all tool subsystems
         init_task_tools(task_manager, background_runner)
@@ -240,6 +327,39 @@ class ToolBroker:
             "mcp_add_server": mcp_add_server_handler,
             "mcp_remove_server": mcp_remove_server_handler,
             "mcp_restart_server": mcp_restart_server_handler,
+
+            # ===== Phase 3: Code Formatting =====
+            "format_file": format_file_handler,
+            "format_directory": format_directory_handler,
+            "detect_formatters": detect_formatters_handler,
+
+            # ===== Phase 3: Profiling =====
+            "profile_python": profile_python_handler,
+            "profile_node": profile_node_handler,
+            "profile_analyze": profile_analyze_handler,
+
+            # ===== Phase 3: Database =====
+            "db_connect": db_connect_handler,
+            "db_query": db_query_handler,
+            "db_schema": db_schema_handler,
+            "db_close": db_close_handler,
+
+            # ===== Phase 3: Debugging =====
+            "debug_start": debug_start_handler,
+            "debug_breakpoint": debug_breakpoint_handler,
+            "debug_continue": debug_continue_handler,
+            "debug_stack": debug_stack_handler,
+            "debug_evaluate": debug_evaluate_handler,
+            "debug_stop": debug_stop_handler,
+
+            # ===== Phase 3: Security =====
+            "scan_dependencies": scan_dependencies_handler,
+
+            # ===== Phase 3: CI/CD =====
+            "ci_status": ci_status_handler,
+            "ci_test_results": ci_test_results_handler,
+            "ci_generate_workflow": ci_generate_workflow_handler,
+            "ci_trigger": ci_trigger_handler,
         }
 
     async def execute(
@@ -267,6 +387,17 @@ class ToolBroker:
         tool = self._tools.get(tool_name)
         if not tool:
             raise ValueError(f"Unknown tool: {tool_name}")
+
+        # Bug fix 2.2: Check for parse error marker in arguments
+        if isinstance(args, dict) and args.get("__parse_error__"):
+            error_msg = args.get("__error_message__", "Invalid tool arguments")
+            logger.error(f"Tool {tool_name} called with invalid arguments: {error_msg}")
+            return ToolResult(
+                success=False,
+                output=None,
+                duration_ms=0,
+                error=f"Tool arguments parsing failed: {error_msg}",
+            )
 
         # Run pre-tool hooks
         if self._hook_manager:
@@ -314,6 +445,16 @@ class ToolBroker:
 
         start_time = time.time()
 
+        # v4 enhancement: Check cache for cacheable tools
+        cache_key = None
+        if self._cache_enabled and tool_name in self._cacheable_tools:
+            cache_key = self._get_cache_key(tool_name, args)
+            cached = self._get_cached(cache_key)
+            if cached is not None:
+                self._cache_hits += 1
+                logger.debug(f"Cache hit for {tool_name}")
+                return cached
+
         try:
             # Execute with timeout
             result = await asyncio.wait_for(
@@ -340,6 +481,11 @@ class ToolBroker:
                 truncated=truncated,
                 error=error,
             )
+
+            # v4 enhancement: Cache successful results
+            if cache_key and success:
+                self._set_cached(cache_key, tool_result)
+                self._cache_misses += 1
 
             # Run post-tool hooks
             if self._hook_manager:
@@ -890,9 +1036,66 @@ class ToolBroker:
         }
 
     async def _bash(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute shell command."""
+        """Execute shell command.
+
+        If sandbox is enabled and capsule manager is available, executes
+        command through the sandbox. Otherwise executes directly.
+        """
         command = args["command"]
         timeout = args.get("timeout", 120)
+        env = args.get("env")
+
+        # Use capsule manager if sandbox is enabled
+        if self._enable_sandbox and self._capsule_manager is not None:
+            return await self._bash_sandboxed(command, timeout, env)
+
+        # Direct execution (no sandbox)
+        return await self._bash_direct(command, timeout, env)
+
+    async def _bash_sandboxed(
+        self,
+        command: str,
+        timeout: float,
+        env: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """Execute command through capsule sandbox."""
+        try:
+            exit_code, stdout, stderr = await self._capsule_manager.execute(
+                command=command,
+                timeout=timeout,
+                env=env,
+            )
+
+            output = stdout + stderr
+
+            # Truncate if too long
+            if len(output) > 30000:
+                output = output[:30000] + "\n... (truncated)"
+
+            return {
+                "output": output,
+                "exit_code": exit_code,
+                "sandboxed": True,
+            }
+        except Exception as e:
+            logger.error(f"Sandboxed execution failed: {e}")
+            return {
+                "output": "",
+                "exit_code": -1,
+                "error": str(e),
+                "sandboxed": True,
+            }
+
+    async def _bash_direct(
+        self,
+        command: str,
+        timeout: float,
+        env: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """Execute command directly (no sandbox)."""
+        env_dict = {**os.environ, "NO_COLOR": "1"}
+        if env:
+            env_dict.update(env)
 
         # Run in workspace directory
         process = await asyncio.create_subprocess_shell(
@@ -900,10 +1103,7 @@ class ToolBroker:
             cwd=str(self.workspace_dir),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env={
-                **os.environ,
-                "NO_COLOR": "1",
-            },
+            env=env_dict,
         )
 
         try:
@@ -924,6 +1124,7 @@ class ToolBroker:
         return {
             "output": output,
             "exit_code": process.returncode,
+            "sandboxed": False,
         }
 
     async def _list_directory(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1469,6 +1670,33 @@ class ToolBroker:
         from .mcp_tools import set_mcp_proxy
         set_mcp_proxy(mcp_proxy)
 
+    def set_capsule_manager(self, capsule_manager: "CapsuleManager") -> None:
+        """Set the capsule manager for sandboxed execution."""
+        self._capsule_manager = capsule_manager
+        self._enable_sandbox = True
+        logger.info("CapsuleManager set for sandboxed execution")
+
+    def enable_sandbox(self, enable: bool = True) -> None:
+        """Enable or disable sandboxed execution."""
+        self._enable_sandbox = enable and self._capsule_manager is not None
+        logger.info(f"Sandbox {'enabled' if self._enable_sandbox else 'disabled'}")
+
+    async def get_sandbox_status(self) -> Dict[str, Any]:
+        """Get sandbox status."""
+        if self._capsule_manager is None:
+            return {
+                "enabled": False,
+                "available": False,
+                "reason": "No capsule manager configured",
+            }
+
+        status = await self._capsule_manager.get_status()
+        return {
+            "enabled": self._enable_sandbox,
+            "available": True,
+            **status,
+        }
+
     def _check_plan_enforcement(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Check if tool is allowed by the current plan.
 
@@ -1539,3 +1767,98 @@ class ToolBroker:
                         return {"allowed": True}
 
         return {"allowed": True}
+
+    # ==================== v4 Cache Methods ====================
+
+    def _get_cache_key(self, tool_name: str, args: Dict[str, Any]) -> str:
+        """Generate a cache key for a tool call."""
+        import hashlib
+        # Create a deterministic key from tool name and args
+        args_str = json.dumps(args, sort_keys=True)
+        key_str = f"{tool_name}:{args_str}"
+        return hashlib.md5(key_str.encode()).hexdigest()
+
+    def _get_cached(self, cache_key: str) -> Optional[ToolResult]:
+        """Get a cached result if valid."""
+        entry = self._cache.get(cache_key)
+        if entry is None:
+            return None
+
+        # Check TTL
+        if time.time() - entry.timestamp > self._cache_ttl:
+            del self._cache[cache_key]
+            return None
+
+        entry.hits += 1
+        return entry.result
+
+    def _set_cached(self, cache_key: str, result: ToolResult) -> None:
+        """Cache a tool result."""
+        self._cache[cache_key] = CacheEntry(
+            result=result,
+            timestamp=time.time(),
+        )
+
+        # Bug fix 5.4: Proper LRU eviction with size-based cleanup
+        # When cache exceeds max size, reduce to 75% capacity
+        max_cache_size = 1000
+        target_size = int(max_cache_size * 0.75)  # 750 entries
+
+        if len(self._cache) > max_cache_size:
+            # Remove oldest entries until we reach target size
+            entries_to_remove = len(self._cache) - target_size
+            sorted_keys = sorted(
+                self._cache.keys(),
+                key=lambda k: (self._cache[k].hits, self._cache[k].timestamp),  # LRU: least hits, then oldest
+            )
+            for key in sorted_keys[:entries_to_remove]:
+                del self._cache[key]
+
+    def invalidate_cache_for_file(self, file_path: str) -> None:
+        """Invalidate cache entries related to a file.
+
+        Call this after edit_file/write_file to ensure fresh reads.
+        """
+        file_path_str = str(file_path)
+        keys_to_delete = []
+
+        for key, entry in self._cache.items():
+            # Check if the cached result relates to this file
+            output = entry.result.output
+            if isinstance(output, dict):
+                cached_path = output.get("path", "")
+                if cached_path and file_path_str in cached_path:
+                    keys_to_delete.append(key)
+
+        for key in keys_to_delete:
+            del self._cache[key]
+
+        if keys_to_delete:
+            logger.debug(f"Invalidated {len(keys_to_delete)} cache entries for {file_path}")
+
+    def clear_cache(self) -> None:
+        """Clear all cached results."""
+        self._cache.clear()
+        logger.debug("Cache cleared")
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get cache statistics."""
+        return {
+            "entries": len(self._cache),
+            "hits": self._cache_hits,
+            "misses": self._cache_misses,
+            "hit_rate": self._cache_hits / (self._cache_hits + self._cache_misses)
+                       if (self._cache_hits + self._cache_misses) > 0 else 0,
+            "enabled": self._cache_enabled,
+            "ttl_seconds": self._cache_ttl,
+        }
+
+    def set_cache_enabled(self, enabled: bool) -> None:
+        """Enable or disable caching."""
+        self._cache_enabled = enabled
+        if not enabled:
+            self.clear_cache()
+
+    def set_cache_ttl(self, ttl_seconds: float) -> None:
+        """Set cache TTL."""
+        self._cache_ttl = ttl_seconds
