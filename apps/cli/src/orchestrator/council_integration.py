@@ -191,7 +191,7 @@ class CouncilIntegration:
             timeout = self._default_timeout
 
             if self._mode_manager:
-                mode_config = self._mode_manager.current_config
+                mode_config = self._mode_manager.config
                 if hasattr(mode_config, "council_perspectives"):
                     perspectives = mode_config.council_perspectives
                 if hasattr(mode_config, "council_timeout"):
