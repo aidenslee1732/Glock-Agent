@@ -48,12 +48,34 @@ class ModelTier(Enum):
 class LLMConfig(BaseModel):
     """Configuration for LLM gateway."""
     default_provider: str = "anthropic"
+
+    # Provider mode: "direct" | "bedrock" | "hybrid"
+    # - direct: Use provider APIs directly (default)
+    # - bedrock: Route all calls through AWS Bedrock
+    # - hybrid: Bedrock for Anthropic, direct API for OpenAI
+    provider_mode: str = "direct"
+
+    # AWS Bedrock configuration
+    aws_region: Optional[str] = None
+    aws_access_key_id: Optional[str] = None
+    aws_secret_access_key: Optional[str] = None
+
+    # Direct API tier models
     tier_models: dict[str, str] = Field(default_factory=lambda: {
         "fast": "claude-3-haiku-20240307",
         "standard": "claude-sonnet-4-20250514",
         "advanced": "claude-opus-4-20250514",
         "reasoning": "claude-opus-4-20250514"
     })
+
+    # Bedrock tier models (Anthropic via Bedrock)
+    bedrock_tier_models: dict[str, str] = Field(default_factory=lambda: {
+        "fast": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+        "standard": "bedrock/anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "advanced": "bedrock/anthropic.claude-opus-4-6-v1",
+        "reasoning": "bedrock/anthropic.claude-opus-4-6-v1"
+    })
+
     default_max_tokens: int = 8000
     default_temperature: float = 0.7
     timeout_seconds: int = 120
@@ -181,6 +203,18 @@ class LLMGateway:
             if self.config.litellm_api_base:
                 litellm.api_base = self.config.litellm_api_base
 
+            # AWS Bedrock credentials (for hybrid/bedrock modes)
+            if self.config.provider_mode in ("bedrock", "hybrid"):
+                if self.config.aws_access_key_id:
+                    os.environ.setdefault("AWS_ACCESS_KEY_ID", self.config.aws_access_key_id)
+                if self.config.aws_secret_access_key:
+                    os.environ.setdefault("AWS_SECRET_ACCESS_KEY", self.config.aws_secret_access_key)
+                if self.config.aws_region:
+                    os.environ.setdefault("AWS_REGION_NAME", self.config.aws_region)
+                else:
+                    os.environ.setdefault("AWS_REGION_NAME", "us-east-1")
+
+            # Direct API keys (always needed for hybrid, fallback)
             litellm.anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
             litellm.openai_key = os.environ.get("OPENAI_API_KEY")
             litellm.google_key = os.environ.get("GOOGLE_API_KEY")
@@ -188,8 +222,35 @@ class LLMGateway:
         self._request_times: list[float] = []
 
     def _get_model_for_tier(self, tier: ModelTier) -> str:
-        """Get model name for tier."""
-        return self.config.tier_models.get(tier.value, self.config.tier_models["standard"])
+        """Get model name for tier based on provider mode."""
+        tier_value = tier.value
+        base_model = self.config.tier_models.get(tier_value, self.config.tier_models["standard"])
+
+        if self.config.provider_mode == "direct":
+            return base_model
+
+        if self.config.provider_mode == "bedrock":
+            return self.config.bedrock_tier_models.get(
+                tier_value, self.config.bedrock_tier_models["standard"]
+            )
+
+        # Hybrid mode: Anthropic via Bedrock, OpenAI direct
+        if self.config.provider_mode == "hybrid":
+            if "claude" in base_model.lower():
+                return self.config.bedrock_tier_models.get(
+                    tier_value, self.config.bedrock_tier_models["standard"]
+                )
+            return base_model  # OpenAI stays direct
+
+        return base_model
+
+    def _is_bedrock_error(self, error: Exception) -> bool:
+        """Check if an error is a Bedrock-specific error that should trigger fallback."""
+        error_str = str(error).lower()
+        return any(x in error_str for x in [
+            "bedrock", "throttlingexception", "accessdenied",
+            "modelnotfound", "validationexception", "resourcenotfound"
+        ])
 
     async def _check_rate_limit(self) -> None:
         """Check and enforce rate limiting."""
@@ -267,6 +328,18 @@ class LLMGateway:
             except Exception as e:
                 last_error = e
                 logger.warning(f"LLM request failed (attempt {attempt + 1}): {e}")
+
+                # Bedrock fallback: if using Bedrock and it fails, try direct API
+                if self._is_bedrock_error(e) and self.config.provider_mode != "direct":
+                    fallback_model = self.config.tier_models.get(
+                        tier.value, self.config.tier_models["standard"]
+                    )
+                    if fallback_model != model:
+                        logger.warning(f"Bedrock failed, falling back to direct API: {fallback_model}")
+                        model = fallback_model
+                        # Continue to next attempt with direct model
+                        if attempt < self.config.max_retries - 1:
+                            continue
 
                 if attempt < self.config.max_retries - 1:
                     delay = self.config.retry_delay_seconds * (2 ** attempt)
